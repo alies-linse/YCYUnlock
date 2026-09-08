@@ -1,4 +1,3 @@
-```objc
 #import <UIKit/UIKit.h>
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <QuartzCore/QuartzCore.h>
@@ -749,4 +748,3 @@ forCharacteristic:
     YCYLog(@"BLE Monitor Ready");
     YCYLog(@"==============================");
 }
-```
