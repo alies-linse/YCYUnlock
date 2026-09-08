@@ -8,6 +8,6 @@ TWEAK_NAME = YCYUnlock
 
 YCYUnlock_FILES = Tweak.x
 YCYUnlock_CFLAGS = -fobjc-arc
-YCYUnlock_FRAMEWORKS = UIKit Foundation QuartzCore
+YCYUnlock_FRAMEWORKS = UIKit CoreBluetooth Foundation QuartzCore
 
 include $(THEOS_MAKE_PATH)/tweak.mk
