@@ -1,0 +1,9 @@
+Package: com.ycy.unlock
+Name: YCYUnlock
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: YCYUnlock
+Maintainer: YCY
+Author: YCY
+Section: Tweaks
+Depends: firmware (>= 13.0)
