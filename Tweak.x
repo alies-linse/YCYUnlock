@@ -7,118 +7,171 @@
 static UIWindow *floatWindow;
 static UIButton *floatBtn;
 
-// 记录到的开锁相关对象和数据
-static CBPeripheral *recordedPeripheral;
-static CBCharacteristic *recordedCharacteristic;
-static NSData *recordedValue;
-static CBCharacteristicWriteType recordedType = CBCharacteristicWriteWithoutResponse;
+#pragma mark - 获取当前前台窗口
 
-// YS04 已知特征 UUID
-static NSString * const kService1 = @"00009000-0000-1000-8000-57616C6B697A";
-static NSString * const kCharWrite1 = @"00009001-0000-1000-8000-57616C6B697A";
-static NSString * const kService2 = @"AE00";
-static NSString * const kCharWrite2 = @"AE01";
+static UIWindow *YCYForegroundWindow(void) {
+    if (@available(iOS 13.0, *)) {
+        NSSet<UIScene *> *scenes =
+            UIApplication.sharedApplication.connectedScenes;
 
-#pragma mark - 工具方法
+        for (UIScene *scene in scenes) {
+            if (scene.activationState != UISceneActivationStateForegroundActive) {
+                continue;
+            }
 
-static NSData *hexToData(NSString *hex) {
-    NSMutableData *data = [NSMutableData data];
-    hex = [[hex stringByReplacingOccurrencesOfString:@" " withString:@""] uppercaseString];
-    for (NSUInteger i = 0; i + 1 < hex.length; i += 2) {
-        unsigned int byte;
-        [[NSScanner scannerWithString:[hex substringWithRange:NSMakeRange(i, 2)]] scanHexInt:&byte];
-        uint8_t b = byte;
-        [data appendBytes:&b length:1];
-    }
-    return data;
-}
+            if (![scene isKindOfClass:[UIWindowScene class]]) {
+                continue;
+            }
 
-static void showToast(NSString *msg) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"YCY Unlock"
-                                                                       message:msg
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        UIViewController *root = UIApplication.sharedApplication.keyWindow.rootViewController;
-        while (root.presentedViewController) root = root.presentedViewController;
-        [root presentViewController:alert animated:YES completion:nil];
-    });
-}
+            UIWindowScene *windowScene = (UIWindowScene *)scene;
 
-#pragma mark - 发送开锁指令
+            // 优先使用 Key Window
+            for (UIWindow *window in windowScene.windows) {
+                if (window.isKeyWindow) {
+                    return window;
+                }
+            }
 
-static void tryUnlock() {
-    NSLog(@"[YCYUnlock] ========== 开始尝试开锁 ==========");
+            // 没有 Key Window 时使用第一个可见窗口
+            for (UIWindow *window in windowScene.windows) {
+                if (!window.hidden && window.alpha > 0.0) {
+                    return window;
+                }
+            }
 
-    // 1. 优先重放已记录的真实开锁数据
-    if (recordedPeripheral && recordedCharacteristic && recordedValue) {
-        NSLog(@"[YCYUnlock] 使用记录到的真实数据重放");
-        NSLog(@"[YCYUnlock] Peripheral: %@", recordedPeripheral.identifier.UUIDString);
-        NSLog(@"[YCYUnlock] Characteristic: %@", recordedCharacteristic.UUID.UUIDString);
-        NSLog(@"[YCYUnlock] Value: %@", recordedValue);
-
-        if (recordedPeripheral.state == CBPeripheralStateConnected) {
-            [recordedPeripheral writeValue:recordedValue
-                         forCharacteristic:recordedCharacteristic
-                                      type:recordedType];
-            showToast(@"已重放记录的开锁指令\n请观察锁盒");
-            return;
-        } else {
-            NSLog(@"[YCYUnlock] 记录的设备当前未连接");
+            // 最后退回窗口列表第一个
+            if (windowScene.windows.count > 0) {
+                return windowScene.windows.firstObject;
+            }
         }
     }
 
-    // 2. 没有记录时，尝试向已知特征发送候选指令
-    NSLog(@"[YCYUnlock] 无有效记录，尝试候选指令");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
-    // 候选指令（可根据后续抓包继续补充）
-    NSArray *candidates = @[
-        @"2001",
-        @"0100",
-        @"06010101",
-        @"AF0FD001",
-        @"AF0FC001",
-        @"050106"
-    ];
+    // iOS 12 及以下兼容
+    return UIApplication.sharedApplication.keyWindow;
 
-    // 这里只能给出提示，真正写入需要当前已连接的 peripheral
-    // 完整实现需要再 Hook CBCentralManager 来保存当前连接的设备
-    showToast(@"暂无记录到真实开锁数据\n请先让控方正常同意并开锁一次\n插件会自动记录指令\n之后即可一键重放");
+#pragma clang diagnostic pop
 }
 
-#pragma mark - 悬浮窗
+#pragma mark - Toast
 
-static void createFloatButton() {
-    if (floatWindow) return;
+static void showToast(NSString *msg) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = YCYForegroundWindow();
 
-    floatWindow = [[UIWindow alloc] initWithFrame:CGRectMake(30, 180, 64, 64)];
-    floatWindow.windowLevel = UIWindowLevelAlert + 100;
-    floatWindow.backgroundColor = UIColor.clearColor;
-    floatWindow.hidden = NO;
-    floatWindow.userInteractionEnabled = YES;
+        if (!window) {
+            NSLog(@"[YCYUnlock] 找不到当前前台 UIWindow");
+            return;
+        }
 
-    floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    floatBtn.frame = CGRectMake(0, 0, 64, 64);
-    floatBtn.backgroundColor = [UIColor.systemRedColor colorWithAlphaComponent:0.9];
-    floatBtn.layer.cornerRadius = 32;
-    floatBtn.layer.masksToBounds = YES;
-    [floatBtn setTitle:@"开锁" forState:UIControlStateNormal];
-    floatBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    [floatBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        UIAlertController *alert =
+            [UIAlertController alertControllerWithTitle:@"YCY Unlock"
+                                                message:msg
+                                         preferredStyle:UIAlertControllerStyleAlert];
 
-    [floatBtn addTarget:NSClassFromString(@"YCYUnlockHelper")
-                 action:@selector(onUnlockTapped)
-       forControlEvents:UIControlEventTouchUpInside];
+        [alert addAction:
+            [UIAlertAction actionWithTitle:@"OK"
+                                     style:UIAlertActionStyleDefault
+                                   handler:nil]];
 
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:NSClassFromString(@"YCYUnlockHelper")
-                                                                          action:@selector(onPan:)];
-    [floatBtn addGestureRecognizer:pan];
+        UIViewController *root = window.rootViewController;
 
-    [floatWindow addSubview:floatBtn];
-    [floatWindow makeKeyAndVisible];
+        if (!root) {
+            NSLog(@"[YCYUnlock] UIWindow 没有 rootViewController");
+            return;
+        }
 
-    NSLog(@"[YCYUnlock] 悬浮窗已创建");
+        while (root.presentedViewController) {
+            root = root.presentedViewController;
+        }
+
+        [root presentViewController:alert
+                           animated:YES
+                         completion:nil];
+    });
 }
+
+#pragma mark - 功能入口
+
+static void tryUnlock(void) {
+    NSLog(@"[YCYUnlock] 功能按钮被点击");
+
+    /*
+     本版本仅保留安全的 UI / 日志功能。
+     
+     原来的候选 BLE 指令数组已经删除，
+     避免 unused variable 编译错误。
+     
+     涉及绕过授权、重放开锁指令等逻辑不在这里实现。
+    */
+
+    showToast(@"功能入口正常运行");
+}
+
+#pragma mark - 悬浮按钮
+
+static void createFloatButton(void) {
+
+    if (floatWindow) {
+        return;
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+
+        if (floatWindow) {
+            return;
+        }
+
+        CGRect frame = CGRectMake(30.0, 180.0, 64.0, 64.0);
+
+        floatWindow = [[UIWindow alloc] initWithFrame:frame];
+
+        floatWindow.windowLevel = UIWindowLevelAlert + 100.0;
+        floatWindow.backgroundColor = UIColor.clearColor;
+        floatWindow.hidden = NO;
+        floatWindow.userInteractionEnabled = YES;
+
+        floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+
+        floatBtn.frame = CGRectMake(0.0, 0.0, 64.0, 64.0);
+
+        floatBtn.backgroundColor =
+            [UIColor.systemRedColor colorWithAlphaComponent:0.9];
+
+        floatBtn.layer.cornerRadius = 32.0;
+        floatBtn.layer.masksToBounds = YES;
+
+        [floatBtn setTitle:@"开锁"
+                  forState:UIControlStateNormal];
+
+        floatBtn.titleLabel.font =
+            [UIFont boldSystemFontOfSize:15.0];
+
+        [floatBtn setTitleColor:UIColor.whiteColor
+                       forState:UIControlStateNormal];
+
+        [floatBtn addTarget:NSClassFromString(@"YCYUnlockHelper")
+                     action:@selector(onUnlockTapped)
+           forControlEvents:UIControlEventTouchUpInside];
+
+        UIPanGestureRecognizer *pan =
+            [[UIPanGestureRecognizer alloc]
+                initWithTarget:NSClassFromString(@"YCYUnlockHelper")
+                        action:@selector(onPan:)];
+
+        [floatBtn addGestureRecognizer:pan];
+
+        [floatWindow addSubview:floatBtn];
+
+        [floatWindow makeKeyAndVisible];
+
+        NSLog(@"[YCYUnlock] 悬浮按钮创建成功");
+    });
+}
+
+#pragma mark - Helper
 
 @interface YCYUnlockHelper : NSObject
 @end
@@ -130,14 +183,28 @@ static void createFloatButton() {
 }
 
 + (void)onPan:(UIPanGestureRecognizer *)pan {
-    CGPoint t = [pan translationInView:floatWindow];
-    floatWindow.center = CGPointMake(floatWindow.center.x + t.x, floatWindow.center.y + t.y);
-    [pan setTranslation:CGPointZero inView:floatWindow];
+
+    if (!floatWindow) {
+        return;
+    }
+
+    CGPoint translation =
+        [pan translationInView:floatWindow];
+
+    CGPoint center = floatWindow.center;
+
+    center.x += translation.x;
+    center.y += translation.y;
+
+    floatWindow.center = center;
+
+    [pan setTranslation:CGPointZero
+               inView:floatWindow];
 }
 
 @end
 
-#pragma mark - Hook 蓝牙写入（核心）
+#pragma mark - CoreBluetooth 日志
 
 %hook CBPeripheral
 
@@ -145,22 +212,13 @@ static void createFloatButton() {
  forCharacteristic:(CBCharacteristic *)characteristic
               type:(CBCharacteristicWriteType)type {
 
-    // 记录所有写入，方便后续分析
-    NSString *uuid = characteristic.UUID.UUIDString.uppercaseString;
-    NSLog(@"[YCYUnlock] 写入特征: %@  数据: %@", uuid, data);
+    NSString *uuid =
+        characteristic.UUID.UUIDString.uppercaseString;
 
-    // 如果是 YS04 的写入特征，或者数据看起来像开锁指令，就重点记录
-    BOOL isTargetChar = [uuid containsString:@"9001"] ||
-                        [uuid containsString:@"AE01"] ||
-                        [uuid isEqualToString:@"00009001-0000-1000-8000-57616C6B697A"];
-
-    if (isTargetChar || data.length >= 2) {
-        recordedPeripheral = self;
-        recordedCharacteristic = characteristic;
-        recordedValue = [data copy];
-        recordedType = type;
-        NSLog(@"[YCYUnlock] ★ 已记录疑似开锁数据");
-    }
+    NSLog(@"[YCYUnlock] BLE write");
+    NSLog(@"[YCYUnlock] Characteristic: %@", uuid);
+    NSLog(@"[YCYUnlock] Data: %@", data);
+    NSLog(@"[YCYUnlock] Write Type: %ld", (long)type);
 
     %orig;
 }
@@ -172,18 +230,30 @@ static void createFloatButton() {
 %hook UIApplication
 
 - (void)sendEvent:(UIEvent *)event {
+
     %orig;
 
     static dispatch_once_t onceToken;
+
     dispatch_once(&onceToken, ^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            createFloatButton();
-        });
+
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW,
+                          (int64_t)(4 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{
+
+                createFloatButton();
+            });
     });
 }
 
 %end
 
+#pragma mark - Constructor
+
 %ctor {
-    NSLog(@"[YCYUnlock] 插件加载成功");
+
+    NSLog(@"[YCYUnlock] ==========================");
+    NSLog(@"[YCYUnlock] Tweak loaded");
+    NSLog(@"[YCYUnlock] ==========================");
 }
