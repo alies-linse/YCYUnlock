@@ -367,7 +367,6 @@ static BOOL YCYWriteData(CBPeripheral *peripheral,
 
 static NSInteger YCYReplayBurst(NSArray<YCYRecordedWrite *> *burst) {
     NSArray *connected = YCYConnectedPeripherals();
-    __block NSInteger sent = 0;
 
     void (^sendOne)(YCYRecordedWrite *) = ^(YCYRecordedWrite *item) {
         CBPeripheral *target = nil;
@@ -400,7 +399,9 @@ static NSInteger YCYReplayBurst(NSArray<YCYRecordedWrite *> *burst) {
             }
         }
         if (!ch) ch = YCYWriteCharacteristics(target).firstObject;
-        if (ch && YCYWriteData(target, ch, item.value)) sent++;
+        if (ch) {
+            YCYWriteData(target, ch, item.value);
+        }
     };
 
     for (NSUInteger i = 0; i < burst.count; i++) {
