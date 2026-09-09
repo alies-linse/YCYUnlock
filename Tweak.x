@@ -20,10 +20,14 @@ static NSMutableArray<NSString *> *bleLogs;
 static NSLock *bleLogLock;
 
 static BOOL monitorEnabled = YES;
-static BOOL recordingEnabled = YES;
+static BOOL gIgnoreHookWrite = NO;
+static BOOL gUnlockInFlight = NO;
 
 static NSMutableSet<CBPeripheral *> *knownPeripherals;
 static NSLock *peripheralLock;
+static CBCentralManager *appCentral;
+static NSUUID *lastLockUUID;
+static NSString *lastLockName;
 
 @interface YCYRecordedWrite : NSObject
 @property (nonatomic, copy) NSUUID *peripheralID;
@@ -38,7 +42,7 @@ static NSLock *peripheralLock;
 @implementation YCYRecordedWrite
 @end
 
-static NSMutableArray<YCYRecordedWrite *> *recordedWrites;
+static NSMutableArray<YCYRecordedWrite *> *canonicalWrites;
 static NSLock *recordLock;
 
 #pragma mark - 工具
@@ -48,7 +52,7 @@ static void YCYInitState(void) {
     dispatch_once(&onceToken, ^{
         bleLogs = [NSMutableArray array];
         bleLogLock = [[NSLock alloc] init];
-        recordedWrites = [NSMutableArray array];
+        canonicalWrites = [NSMutableArray array];
         recordLock = [[NSLock alloc] init];
         knownPeripherals = [NSMutableSet set];
         peripheralLock = [[NSLock alloc] init];
@@ -85,22 +89,6 @@ static NSString *YCYHexString(NSData *data) {
     return result;
 }
 
-static NSData *YCYDataFromHex(NSString *hex) {
-    NSString *clean = [[hex uppercaseString]
-        stringByReplacingOccurrencesOfString:@" " withString:@""];
-    if (clean.length < 2 || (clean.length % 2) != 0) return nil;
-    NSMutableData *data = [NSMutableData dataWithCapacity:clean.length / 2];
-    for (NSUInteger i = 0; i + 1 < clean.length; i += 2) {
-        unsigned int byte = 0;
-        NSScanner *scanner = [NSScanner scannerWithString:
-            [clean substringWithRange:NSMakeRange(i, 2)]];
-        if (![scanner scanHexInt:&byte]) return nil;
-        uint8_t b = (uint8_t)byte;
-        [data appendBytes:&b length:1];
-    }
-    return data;
-}
-
 static NSString *YCYUUIDString(NSUUID *uuid) {
     return uuid.UUIDString ?: @"<nil>";
 }
@@ -127,7 +115,6 @@ static BOOL YCYUUIDMatch(NSString *a, NSString *b) {
     NSString *y = YCYNormUUID(b);
     if (x.length == 0 || y.length == 0) return NO;
     if ([x isEqualToString:y]) return YES;
-    // 16-bit 短 UUID 对比（AE01 vs 0000AE01-0000-1000-8000-00805F9B34FB）
     NSString *shortX = x;
     NSString *shortY = y;
     if (x.length == 36 && [x hasPrefix:@"0000"] && [x hasSuffix:@"-0000-1000-8000-00805F9B34FB"]) {
@@ -154,12 +141,20 @@ static BOOL YCYIsTargetCharacteristic(NSString *uuid) {
 static BOOL YCYLooksLikeUnlockPayload(NSData *data) {
     if (!data || data.length < 2) return NO;
     const unsigned char *b = data.bytes;
-    // YS0x: 01 00  (token) / 20 01 ... (open)
-    if (data.length >= 2 && b[0] == 0x01 && b[1] == 0x00) return YES;
-    if (data.length >= 2 && b[0] == 0x20 && b[1] == 0x01) return YES;
+    if (b[0] == 0x01 && b[1] == 0x00) return YES;
+    if (b[0] == 0x20 && b[1] == 0x01) return YES;
     if (data.length >= 3 && b[0] == 0x05 && b[1] == 0x01 && b[2] == 0x06) return YES;
     if (data.length >= 4 && b[0] == 0x06 && b[1] == 0x01 && b[2] == 0x01 && b[3] == 0x01) return YES;
     if (data.length >= 4 && b[0] == 0xAF && b[1] == 0x0F && (b[2] == 0xC0 || b[2] == 0xD0)) return YES;
+    return NO;
+}
+
+static BOOL YCYLooksLikeLockName(NSString *name) {
+    if (name.length == 0) return NO;
+    NSString *n = name.uppercaseString;
+    if ([n containsString:@"YS04"]) return YES;
+    if ([n containsString:@"YS0"]) return YES;
+    if ([n containsString:@"YISKJ"]) return YES;
     return NO;
 }
 
@@ -180,6 +175,10 @@ static void YCYRememberPeripheral(CBPeripheral *peripheral) {
     [peripheralLock lock];
     [knownPeripherals addObject:peripheral];
     [peripheralLock unlock];
+    if (YCYLooksLikeLockName(peripheral.name) || lastLockUUID == nil) {
+        lastLockUUID = peripheral.identifier;
+        lastLockName = YCYPeripheralName(peripheral);
+    }
 }
 
 static NSArray<CBPeripheral *> *YCYConnectedPeripherals(void) {
@@ -196,11 +195,9 @@ static NSArray<CBPeripheral *> *YCYConnectedPeripherals(void) {
 }
 
 static CBCharacteristic *YCYFindCharacteristic(CBPeripheral *peripheral, NSString *serviceUUID, NSString *charUUID) {
+    (void)serviceUUID;
     if (!peripheral.services) return nil;
     for (CBService *service in peripheral.services) {
-        if (serviceUUID.length && !YCYUUIDMatch(service.UUID.UUIDString, serviceUUID)) {
-            // 允许只按特征 UUID 匹配
-        }
         for (CBCharacteristic *c in service.characteristics) {
             if (YCYUUIDMatch(c.UUID.UUIDString, charUUID)) {
                 return c;
@@ -227,7 +224,6 @@ static NSArray<CBCharacteristic *> *YCYWriteCharacteristics(CBPeripheral *periph
 
 static UIWindow *YCYHostWindow(void) {
     if (floatWindow && !floatWindow.hidden) return floatWindow;
-
     UIApplication *application = [UIApplication sharedApplication];
     if (@available(iOS 13.0, *)) {
         for (UIScene *scene in application.connectedScenes) {
@@ -278,11 +274,12 @@ static void YCYShowToast(NSString *text) {
         toastLabel.alpha = 0;
         [window addSubview:toastLabel];
         [UIView animateWithDuration:0.2 animations:^{ toastLabel.alpha = 1; }];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.4 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             [UIView animateWithDuration:0.25 animations:^{
                 toastLabel.alpha = 0;
             } completion:^(BOOL finished) {
+                (void)finished;
                 [toastLabel removeFromSuperview];
             }];
         });
@@ -291,11 +288,19 @@ static void YCYShowToast(NSString *text) {
 
 #pragma mark - 记录 / 重放
 
+static NSArray<YCYRecordedWrite *> *YCYCanonicalCopy(void) {
+    [recordLock lock];
+    NSArray *all = [canonicalWrites copy];
+    [recordLock unlock];
+    return all;
+}
+
 static void YCYRecordWrite(CBPeripheral *peripheral,
                            CBCharacteristic *characteristic,
                            NSData *data,
                            CBCharacteristicWriteType type) {
-    if (!recordingEnabled || !peripheral || !characteristic || !data) return;
+    if (gIgnoreHookWrite) return;
+    if (!peripheral || !characteristic || !data) return;
 
     NSString *charUUID = characteristic.UUID.UUIDString ?: @"";
     BOOL target = YCYIsTargetCharacteristic(charUUID) || YCYLooksLikeUnlockPayload(data);
@@ -310,34 +315,39 @@ static void YCYRecordWrite(CBPeripheral *peripheral,
     item.type = type;
     item.time = [NSDate date];
 
+    lastLockUUID = peripheral.identifier;
+    lastLockName = item.peripheralName;
+
     [recordLock lock];
-    [recordedWrites addObject:item];
-    if (recordedWrites.count > 40) {
-        [recordedWrites removeObjectsInRange:NSMakeRange(0, recordedWrites.count - 40)];
+    YCYRecordedWrite *last = canonicalWrites.lastObject;
+    BOOL newSession = (canonicalWrites.count == 0);
+    if (last && [item.time timeIntervalSinceDate:last.time] > 8.0) {
+        newSession = YES;
     }
-    [recordLock unlock];
-
-    YCYLog(@"★ 已记录开锁相关写入 name=%@ char=%@ len=%lu HEX=%@",
-           item.peripheralName, item.charUUID,
-           (unsigned long)data.length, YCYHexString(data));
-}
-
-static NSArray<YCYRecordedWrite *> *YCYLatestBurst(void) {
-    [recordLock lock];
-    NSArray *all = [recordedWrites copy];
-    [recordLock unlock];
-    if (all.count == 0) return @[];
-
-    YCYRecordedWrite *last = all.lastObject;
-    NSMutableArray *burst = [NSMutableArray array];
-    // 取最后一次写入前后 4 秒内的目标包，保持顺序
-    for (YCYRecordedWrite *item in all) {
-        if (fabs([item.time timeIntervalSinceDate:last.time]) <= 4.0) {
-            [burst addObject:item];
+    if (newSession) {
+        [canonicalWrites removeAllObjects];
+    }
+    BOOL dup = NO;
+    if (canonicalWrites.count > 0) {
+        YCYRecordedWrite *prev = canonicalWrites.lastObject;
+        if ([prev.charUUID isEqualToString:item.charUUID] &&
+            [prev.value isEqualToData:item.value]) {
+            dup = YES;
         }
     }
-    if (burst.count == 0) [burst addObject:last];
-    return burst;
+    if (!dup) {
+        [canonicalWrites addObject:item];
+        if (canonicalWrites.count > 8) {
+            [canonicalWrites removeObjectsInRange:NSMakeRange(0, canonicalWrites.count - 8)];
+        }
+    }
+    NSUInteger count = canonicalWrites.count;
+    [recordLock unlock];
+
+    if (!dup) {
+        YCYLog(@"★ 记录开锁包 #%lu name=%@ char=%@ HEX=%@",
+               (unsigned long)count, item.peripheralName, item.charUUID, YCYHexString(data));
+    }
 }
 
 static BOOL YCYWriteData(CBPeripheral *peripheral,
@@ -365,45 +375,58 @@ static BOOL YCYWriteData(CBPeripheral *peripheral,
     }
 }
 
-static NSInteger YCYReplayBurst(NSArray<YCYRecordedWrite *> *burst) {
+static CBPeripheral *YCYPickPeripheral(NSArray<CBPeripheral *> *connected, NSUUID *preferID) {
+    if (preferID) {
+        for (CBPeripheral *p in connected) {
+            if ([p.identifier isEqual:preferID]) return p;
+        }
+    }
+    for (CBPeripheral *p in connected) {
+        if (YCYLooksLikeLockName(p.name)) return p;
+    }
+    return connected.firstObject;
+}
+
+static CBCharacteristic *YCYPickWriteChar(CBPeripheral *target, YCYRecordedWrite *item) {
+    CBCharacteristic *ch = YCYFindCharacteristic(target, item.serviceUUID, item.charUUID);
+    if (ch) return ch;
+    for (CBCharacteristic *c in YCYWriteCharacteristics(target)) {
+        if (YCYIsTargetCharacteristic(c.UUID.UUIDString)) return c;
+    }
+    return YCYWriteCharacteristics(target).firstObject;
+}
+
+static NSInteger YCYReplayBurstOnPeripheral(NSArray<YCYRecordedWrite *> *burst, CBPeripheral *forced) {
+    if (burst.count == 0) return 0;
+
+    gIgnoreHookWrite = YES;
+
     NSArray *connected = YCYConnectedPeripherals();
+    NSMutableArray *pool = [connected mutableCopy] ?: [NSMutableArray array];
+    if (forced && forced.state == CBPeripheralStateConnected) {
+        BOOL exists = NO;
+        for (CBPeripheral *p in pool) {
+            if (p == forced || [p.identifier isEqual:forced.identifier]) { exists = YES; break; }
+        }
+        if (!exists) [pool addObject:forced];
+    }
 
     void (^sendOne)(YCYRecordedWrite *) = ^(YCYRecordedWrite *item) {
-        CBPeripheral *target = nil;
-        for (CBPeripheral *p in connected) {
-            if ([p.identifier isEqual:item.peripheralID]) {
-                target = p;
-                break;
-            }
-        }
-        if (!target && connected.count == 1) target = connected.firstObject;
+        CBPeripheral *target = YCYPickPeripheral(pool, item.peripheralID ?: lastLockUUID);
+        if (!target) target = forced;
         if (!target) {
-            for (CBPeripheral *p in connected) {
-                NSString *name = YCYPeripheralName(p).uppercaseString;
-                if ([name containsString:@"YS"]) {
-                    target = p;
-                    break;
-                }
-            }
+            YCYLog(@"重放失败：没有可用设备");
+            return;
         }
-        if (!target) target = connected.firstObject;
-        if (!target) return;
-
-        CBCharacteristic *ch = YCYFindCharacteristic(target, item.serviceUUID, item.charUUID);
+        CBCharacteristic *ch = YCYPickWriteChar(target, item);
         if (!ch) {
-            for (CBCharacteristic *c in YCYWriteCharacteristics(target)) {
-                if (YCYIsTargetCharacteristic(c.UUID.UUIDString)) {
-                    ch = c;
-                    break;
-                }
-            }
+            YCYLog(@"重放失败：找不到可写特征 %@", item.charUUID);
+            return;
         }
-        if (!ch) ch = YCYWriteCharacteristics(target).firstObject;
-        if (ch) {
-            YCYWriteData(target, ch, item.value);
-        }
+        YCYWriteData(target, ch, item.value);
     };
 
+    NSTimeInterval total = burst.count * 0.12 + 0.8;
     for (NSUInteger i = 0; i < burst.count; i++) {
         YCYRecordedWrite *item = burst[i];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.12 * NSEC_PER_SEC)),
@@ -411,79 +434,272 @@ static NSInteger YCYReplayBurst(NSArray<YCYRecordedWrite *> *burst) {
             sendOne(item);
         });
     }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(total * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        gIgnoreHookWrite = NO;
+        gUnlockInFlight = NO;
+    });
     return (NSInteger)burst.count;
 }
 
-static NSInteger YCYSendCandidates(void) {
-    NSArray *connected = YCYConnectedPeripherals();
-    if (connected.count == 0) return 0;
+#pragma mark - 自建 BLE 连接
 
-    NSArray *hexes = @[
-        @"0100",
-        @"2001",
-        @"2001FFFFFFFF",
-        @"06010101",
-        @"AF0FD001",
-        @"AF0FC001",
-        @"050106"
+@interface YCYBleEngine : NSObject <CBCentralManagerDelegate, CBPeripheralDelegate>
+@property (nonatomic, strong) CBCentralManager *central;
+@property (nonatomic, strong) CBPeripheral *target;
+@property (nonatomic, copy) NSArray<YCYRecordedWrite *> *pendingBurst;
+@property (nonatomic, assign) BOOL busy;
+@property (nonatomic, assign) BOOL replayed;
+@property (nonatomic, assign) NSInteger pendingDiscover;
+@end
+
+static YCYBleEngine *gEngine;
+
+@implementation YCYBleEngine
+
++ (instancetype)shared {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ gEngine = [YCYBleEngine new]; });
+    return gEngine;
+}
+
+- (void)failWith:(NSString *)msg {
+    YCYLog(@"连接流程失败: %@", msg);
+    self.busy = NO;
+    gUnlockInFlight = NO;
+    gIgnoreHookWrite = NO;
+    [self.central stopScan];
+    YCYShowToast(msg);
+}
+
+- (void)finishReplayOn:(CBPeripheral *)peripheral {
+    if (self.replayed) return;
+    self.replayed = YES;
+    self.busy = NO;
+    [self.central stopScan];
+    YCYRememberPeripheral(peripheral);
+    NSInteger n = YCYReplayBurstOnPeripheral(self.pendingBurst, peripheral);
+    YCYShowToast([NSString stringWithFormat:@"已连接，正在重放 %ld 条指令", (long)n]);
+}
+
+- (BOOL)hasWriteChars:(CBPeripheral *)p {
+    return YCYWriteCharacteristics(p).count > 0;
+}
+
+- (void)discoverOn:(CBPeripheral *)peripheral {
+    self.target = peripheral;
+    peripheral.delegate = self;
+    YCYRememberPeripheral(peripheral);
+    if ([self hasWriteChars:peripheral]) {
+        [self finishReplayOn:peripheral];
+        return;
+    }
+    YCYLog(@"开始发现服务 %@", YCYPeripheralName(peripheral));
+    NSArray *svcs = @[
+        [CBUUID UUIDWithString:kYCYSvc9000],
+        [CBUUID UUIDWithString:kYCYSvcAE00]
+    ];
+    [peripheral discoverServices:svcs];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!self.replayed && peripheral.services.count == 0) {
+            [peripheral discoverServices:nil];
+        }
+    });
+}
+
+- (void)connectPeripheral:(CBPeripheral *)peripheral {
+    if (!peripheral) return;
+    YCYLog(@"正在连接 %@ %@", YCYPeripheralName(peripheral), peripheral.identifier.UUIDString);
+    YCYShowToast([NSString stringWithFormat:@"正在连接 %@", YCYPeripheralName(peripheral)]);
+    self.target = peripheral;
+    [self.central stopScan];
+    [self.central connectPeripheral:peripheral options:nil];
+}
+
+- (void)beginWithBurst:(NSArray<YCYRecordedWrite *> *)burst {
+    self.pendingBurst = burst;
+    self.replayed = NO;
+    self.busy = YES;
+    self.target = nil;
+    self.pendingDiscover = 0;
+
+    if (!self.central) {
+        self.central = [[CBCentralManager alloc] initWithDelegate:self
+                                                            queue:dispatch_get_main_queue()
+                                                          options:@{CBCentralManagerOptionShowPowerAlertKey: @YES}];
+    } else {
+        [self centralManagerDidUpdateState:self.central];
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (self.busy && !self.replayed) {
+            [self failWith:@"搜索锁盒超时\n请把 YS04 靠近手机后再试"];
+        }
+    });
+}
+
+- (void)tryRetrieveAndScan {
+    CBCentralManager *c = self.central;
+
+    NSMutableArray *ids = [NSMutableArray array];
+    if (lastLockUUID) [ids addObject:lastLockUUID];
+    for (YCYRecordedWrite *w in self.pendingBurst) {
+        if (w.peripheralID) [ids addObject:w.peripheralID];
+    }
+
+    if (appCentral) {
+        YCYLog(@"appCentral state=%ld", (long)appCentral.state);
+    }
+    if (lastLockName) {
+        YCYLog(@"lastLock name=%@", lastLockName);
+    }
+
+    NSArray *svcs = @[
+        [CBUUID UUIDWithString:kYCYSvc9000],
+        [CBUUID UUIDWithString:kYCYSvcAE00]
     ];
 
-    NSInteger sent = 0;
-    NSInteger delayIndex = 0;
-    for (CBPeripheral *p in connected) {
-        NSArray *chars = YCYWriteCharacteristics(p);
-        NSMutableArray *targets = [NSMutableArray array];
-        for (CBCharacteristic *c in chars) {
-            if (YCYIsTargetCharacteristic(c.UUID.UUIDString)) {
-                [targets addObject:c];
-            }
-        }
-        if (targets.count == 0) [targets addObjectsFromArray:chars];
-
-        for (CBCharacteristic *c in targets) {
-            for (NSString *hex in hexes) {
-                NSData *data = YCYDataFromHex(hex);
-                if (!data) continue;
-                NSInteger capture = delayIndex++;
-                CBPeripheral *pp = p;
-                CBCharacteristic *cc = c;
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(capture * 0.08 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    YCYWriteData(pp, cc, data);
-                });
-                sent++;
-            }
+    if (ids.count > 0) {
+        NSArray *known = [c retrievePeripheralsWithIdentifiers:ids];
+        YCYLog(@"retrievePeripherals count=%lu", (unsigned long)known.count);
+        if (known.count > 0) {
+            [self connectPeripheral:known.firstObject];
+            return;
         }
     }
-    return sent;
+
+    NSArray *already = [c retrieveConnectedPeripheralsWithServices:svcs];
+    YCYLog(@"retrieveConnected count=%lu", (unsigned long)already.count);
+    if (already.count > 0) {
+        CBPeripheral *pick = already.firstObject;
+        for (CBPeripheral *p in already) {
+            if (YCYLooksLikeLockName(p.name)) { pick = p; break; }
+        }
+        if (pick.state == CBPeripheralStateConnected) {
+            [self discoverOn:pick];
+        } else {
+            [self connectPeripheral:pick];
+        }
+        return;
+    }
+
+    YCYLog(@"开始扫描 YS04");
+    YCYShowToast(@"正在搜索 YS04…");
+    [c scanForPeripheralsWithServices:nil
+                              options:@{CBCentralManagerScanOptionAllowDuplicatesKey: @NO}];
 }
+
+- (void)centralManagerDidUpdateState:(CBCentralManager *)central {
+    if (central.state != CBManagerStatePoweredOn) {
+        if (self.busy) {
+            [self failWith:@"系统蓝牙未打开"];
+        }
+        return;
+    }
+    if (self.busy && !self.replayed) {
+        [self tryRetrieveAndScan];
+    }
+}
+
+- (void)centralManager:(CBCentralManager *)central
+ didDiscoverPeripheral:(CBPeripheral *)peripheral
+     advertisementData:(NSDictionary<NSString *,id> *)advertisementData
+                  RSSI:(NSNumber *)RSSI {
+    (void)central;
+    NSString *name = peripheral.name.length
+        ? peripheral.name
+        : advertisementData[CBAdvertisementDataLocalNameKey];
+    YCYLog(@"扫描到 name=%@ uuid=%@ rssi=%@", name, peripheral.identifier.UUIDString, RSSI);
+
+    BOOL match = YCYLooksLikeLockName(name);
+    if (!match && lastLockUUID && [peripheral.identifier isEqual:lastLockUUID]) match = YES;
+    for (YCYRecordedWrite *w in self.pendingBurst) {
+        if (w.peripheralID && [peripheral.identifier isEqual:w.peripheralID]) match = YES;
+    }
+    if (!match) return;
+
+    [self connectPeripheral:peripheral];
+}
+
+- (void)centralManager:(CBCentralManager *)central didConnectPeripheral:(CBPeripheral *)peripheral {
+    (void)central;
+    YCYLog(@"已连接 %@", YCYPeripheralName(peripheral));
+    [self discoverOn:peripheral];
+}
+
+- (void)centralManager:(CBCentralManager *)central
+didFailToConnectPeripheral:(CBPeripheral *)peripheral
+                 error:(NSError *)error {
+    (void)central;
+    (void)peripheral;
+    [self failWith:[NSString stringWithFormat:@"连接失败: %@", error.localizedDescription ?: @"未知错误"]];
+}
+
+- (void)peripheral:(CBPeripheral *)peripheral didDiscoverServices:(NSError *)error {
+    if (error) {
+        YCYLog(@"发现服务失败 %@", error);
+    }
+    self.pendingDiscover = 0;
+    if (peripheral.services.count == 0) {
+        [self failWith:@"已连接但没有发现服务"];
+        return;
+    }
+    for (CBService *s in peripheral.services) {
+        self.pendingDiscover++;
+        [peripheral discoverCharacteristics:nil forService:s];
+    }
+}
+
+- (void)peripheral:(CBPeripheral *)peripheral
+didDiscoverCharacteristicsForService:(CBService *)service
+             error:(NSError *)error {
+    (void)service;
+    (void)error;
+    self.pendingDiscover--;
+    if (self.pendingDiscover <= 0 && !self.replayed) {
+        if ([self hasWriteChars:peripheral]) {
+            [self finishReplayOn:peripheral];
+        } else {
+            [self failWith:@"已连接但没有可写特征"];
+        }
+    }
+}
+
+@end
 
 static void YCYTryUnlock(void) {
     YCYInitState();
-    NSArray *connected = YCYConnectedPeripherals();
-    NSArray *burst = YCYLatestBurst();
+    if (gUnlockInFlight) {
+        YCYShowToast(@"正在开锁，请稍候");
+        return;
+    }
 
-    YCYLog(@"尝试开锁 connected=%lu recordedBurst=%lu",
+    NSArray *burst = YCYCanonicalCopy();
+    NSArray *connected = YCYConnectedPeripherals();
+
+    YCYLog(@"尝试开锁 connected=%lu canonical=%lu",
            (unsigned long)connected.count,
            (unsigned long)burst.count);
 
-    if (connected.count == 0) {
-        YCYShowToast(@"未发现已连接的锁盒\n请先在 App 内连上 YS04");
+    if (burst.count == 0) {
+        YCYShowToast(@"还没有记录到开锁指令\n请先让控方同意并成功开锁一次");
         return;
     }
 
-    if (burst.count > 0) {
-        NSInteger n = YCYReplayBurst(burst);
-        YCYShowToast([NSString stringWithFormat:@"正在重放 %ld 条已记录指令", (long)n]);
+    gUnlockInFlight = YES;
+
+    CBPeripheral *ready = YCYPickPeripheral(connected, lastLockUUID);
+    if (ready && ready.state == CBPeripheralStateConnected &&
+        YCYWriteCharacteristics(ready).count > 0) {
+        NSInteger n = YCYReplayBurstOnPeripheral(burst, ready);
+        YCYShowToast([NSString stringWithFormat:@"正在重放 %ld 条指令", (long)n]);
         return;
     }
 
-    NSInteger n = YCYSendCandidates();
-    if (n > 0) {
-        YCYShowToast(@"没有记录到真实开锁包\n已发送候选指令，建议先正常开锁一次");
-    } else {
-        YCYShowToast(@"已连接，但找不到可写特征\n请先在 App 内打开锁页完成一次发现");
-    }
+    YCYShowToast(@"锁盒未连接，正在自动搜索 YS04…");
+    [[YCYBleEngine shared] beginWithBurst:burst];
 }
 
 #pragma mark - 日志 UI
@@ -509,10 +725,7 @@ static void YCYShowLogs(void) {
 
 static void YCYShowRecords(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        [recordLock lock];
-        NSArray *all = [recordedWrites copy];
-        [recordLock unlock];
-
+        NSArray *all = YCYCanonicalCopy();
         NSMutableString *text = [NSMutableString string];
         if (all.count == 0) {
             [text appendString:@"暂无已记录的开锁指令\n请先让控方正常同意并成功开锁一次"];
@@ -529,7 +742,7 @@ static void YCYShowRecords(void) {
         }
 
         UIAlertController *alert =
-            [UIAlertController alertControllerWithTitle:@"已记录指令"
+            [UIAlertController alertControllerWithTitle:@"已记录指令（仅一次官方开锁）"
                                                 message:text
                                          preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"关闭"
@@ -556,7 +769,7 @@ static void YCYClearLogs(void) {
 
 static void YCYClearRecords(void) {
     [recordLock lock];
-    [recordedWrites removeAllObjects];
+    [canonicalWrites removeAllObjects];
     [recordLock unlock];
     YCYLog(@"Records cleared");
     YCYShowToast(@"已清空记录的开锁指令");
@@ -583,10 +796,11 @@ static void YCYClearRecords(void) {
 @end
 
 static void YCYShowMenu(UIButton *sender) {
+    NSArray *canon = YCYCanonicalCopy();
     NSString *msg = [NSString stringWithFormat:
-        @"短按：立即开锁（重放已记录指令）\n长按：打开本菜单\n监控：%@   已记录：%lu 条\n已连接设备：%lu",
+        @"短按：开锁（未连接会自动搜 YS04）\n长按：本菜单\n监控：%@   记录：%lu 条\n已连接：%lu",
         monitorEnabled ? @"开" : @"关",
-        (unsigned long)recordedWrites.count,
+        (unsigned long)canon.count,
         (unsigned long)YCYConnectedPeripherals().count];
 
     UIAlertController *menu =
@@ -596,26 +810,45 @@ static void YCYShowMenu(UIButton *sender) {
 
     [menu addAction:[UIAlertAction actionWithTitle:@"立即开锁"
                                              style:UIAlertActionStyleDestructive
-                                           handler:^(UIAlertAction *a) { YCYTryUnlock(); }]];
+                                           handler:^(UIAlertAction *a) {
+                                               (void)a;
+                                               YCYTryUnlock();
+                                           }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"查看已记录指令"
                                              style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { YCYShowRecords(); }]];
+                                           handler:^(UIAlertAction *a) {
+                                               (void)a;
+                                               YCYShowRecords();
+                                           }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"查看 BLE 日志"
                                              style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { YCYShowLogs(); }]];
+                                           handler:^(UIAlertAction *a) {
+                                               (void)a;
+                                               YCYShowLogs();
+                                           }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"复制 BLE 日志"
                                              style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { YCYCopyLogs(); }]];
+                                           handler:^(UIAlertAction *a) {
+                                               (void)a;
+                                               YCYCopyLogs();
+                                           }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"清空日志"
                                              style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { YCYClearLogs(); }]];
+                                           handler:^(UIAlertAction *a) {
+                                               (void)a;
+                                               YCYClearLogs();
+                                           }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"清空开锁记录"
                                              style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { YCYClearRecords(); }]];
+                                           handler:^(UIAlertAction *a) {
+                                               (void)a;
+                                               YCYClearRecords();
+                                           }]];
     [menu addAction:[UIAlertAction
         actionWithTitle:monitorEnabled ? @"关闭监控" : @"开启监控"
                   style:UIAlertActionStyleDefault
                 handler:^(UIAlertAction *a) {
+                    (void)a;
                     monitorEnabled = !monitorEnabled;
                     YCYLog(@"Monitor %@", monitorEnabled ? @"enabled" : @"disabled");
                     YCYShowToast(monitorEnabled ? @"监控已开启" : @"监控已关闭");
@@ -745,8 +978,21 @@ static void YCYScheduleFloatingButton(void) {
 
 %hook CBCentralManager
 
+- (instancetype)initWithDelegate:(id<CBCentralManagerDelegate>)delegate
+                           queue:(dispatch_queue_t)queue
+                         options:(NSDictionary *)options {
+    CBCentralManager *obj = %orig;
+    if (obj && delegate && ![delegate isKindOfClass:[YCYBleEngine class]]) {
+        appCentral = obj;
+    }
+    return obj;
+}
+
 - (void)scanForPeripheralsWithServices:(NSArray<CBUUID *> *)serviceUUIDs
                                options:(NSDictionary<NSString *,id> *)options {
+    if (![self.delegate isKindOfClass:[YCYBleEngine class]]) {
+        appCentral = self;
+    }
     if (monitorEnabled) {
         NSMutableArray *uuids = [NSMutableArray array];
         for (CBUUID *uuid in serviceUUIDs) [uuids addObject:uuid.UUIDString];
@@ -756,13 +1002,18 @@ static void YCYScheduleFloatingButton(void) {
 }
 
 - (void)stopScan {
-    if (monitorEnabled) YCYLog(@"stopScan");
+    if (monitorEnabled && ![self.delegate isKindOfClass:[YCYBleEngine class]]) {
+        YCYLog(@"stopScan");
+    }
     %orig;
 }
 
 - (void)connectPeripheral:(CBPeripheral *)peripheral
                   options:(NSDictionary<NSString *,id> *)options {
     YCYRememberPeripheral(peripheral);
+    if (![self.delegate isKindOfClass:[YCYBleEngine class]]) {
+        appCentral = self;
+    }
     if (monitorEnabled) {
         YCYLog(@"connect name=%@ UUID=%@",
                YCYPeripheralName(peripheral),
@@ -903,8 +1154,8 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded");
-    YCYLog(@"短按悬浮窗 = 开锁重放");
-    YCYLog(@"长按悬浮窗 = 菜单 / 日志");
+    YCYLog(@"短按 = 开锁（未连接会自动搜 YS04）");
+    YCYLog(@"长按 = 菜单 / 日志");
     YCYLog(@"==============================");
     YCYScheduleFloatingButton();
 }
