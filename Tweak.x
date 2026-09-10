@@ -453,40 +453,41 @@ static NSArray<YCYRecordedWrite *> *YCYCanonicalCopy(void) {
     return all;
 }
 
+/*
+ * YS04 实际写到 9001 的是 16 字节加密帧，对不上明文特征码。
+ * 重放时：优先明文强特征；否则整段突发原样重放（加密锁的正确做法）。
+ */
 static NSArray<YCYRecordedWrite *> *YCYReplayPackets(NSArray<YCYRecordedWrite *> *burst) {
     NSMutableArray *strong = [NSMutableArray array];
-    NSMutableArray *weakUnlock = [NSMutableArray array];
     for (YCYRecordedWrite *item in burst) {
-        if (YCYLooksLikeStrongUnlock(item.value) || item.unlockLike) {
-            if (YCYLooksLikeStrongUnlock(item.value)) [strong addObject:item];
-            else [weakUnlock addObject:item];
-        } else if (YCYLooksLikeUnlockPayload(item.value)) {
-            [weakUnlock addObject:item];
+        if (YCYLooksLikeStrongUnlock(item.value)) {
+            [strong addObject:item];
         }
     }
     if (strong.count) return strong;
-    if (weakUnlock.count) return weakUnlock;
     return burst;
 }
 
 static void YCYFreezeCanonicalFromSession(void) {
     [recordLock lock];
-    BOOL hasUnlock = NO;
-    for (YCYRecordedWrite *w in liveSession) {
-        if (YCYLooksLikeUnlockPayload(w.value) || YCYLooksLikeStrongUnlock(w.value)) {
-            hasUnlock = YES;
+    if (liveSession.count == 0 && canonicalWrites.count == 0) {
+        [recordLock unlock];
+        return;
+    }
+    if (liveSession.count > 0) {
+        [canonicalWrites removeAllObjects];
+        [canonicalWrites addObjectsFromArray:liveSession];
+        for (YCYRecordedWrite *w in canonicalWrites) {
             w.unlockLike = YES;
         }
     }
-    if (hasUnlock && liveSession.count > 0) {
-        [canonicalWrites removeAllObjects];
-        [canonicalWrites addObjectsFromArray:liveSession];
+    if (canonicalWrites.count > 0) {
         gCanonicalFrozen = YES;
         YCYLog(@"★ 冻结开锁记录 %lu 条（关锁/重连握手不再覆盖）",
                (unsigned long)canonicalWrites.count);
     }
     [recordLock unlock];
-    if (hasUnlock) YCYPersistRecords();
+    if (gCanonicalFrozen) YCYPersistRecords();
 }
 
 static void YCYScheduleFreeze(void) {
@@ -499,7 +500,8 @@ static void YCYScheduleFreeze(void) {
         if (!gCanonicalFrozen) YCYFreezeCanonicalFromSession();
     });
     gFreezeBlock = block;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
+    /* 官方开锁突发通常 1 秒内结束；停笔 1.8s 后冻结，避免把后续关锁包混进来 */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), block);
 }
 
@@ -519,11 +521,9 @@ static void YCYRecordWrite(CBPeripheral *peripheral,
     if (!target) return;
 
     /*
-     * 关键修复：
-     * 旧逻辑只要间隔 > 8 秒就把 canonicalWrites 清空。
-     * 关锁、断开重连后的握手都会写 9001，于是官方开锁包被关锁/握手包覆盖。
-     * 点悬浮窗时提示“正在重放”，实际重放的已经不是开锁指令，锁当然打不开。
-     * 现在：一旦捕获到开锁突发并冻结，后续写包只更新连接状态，不再改记录。
+     * YS04 开锁帧是 16 字节密文，不能再靠 05 01 / AF 0F 等明文特征判断。
+     * 策略：凡写到 9001/AE01 的包都进 liveSession，并提升到 canonical；
+     * 突发结束后冻结，之后关锁/握手不再覆盖。
      */
     if (gCanonicalFrozen) {
         YCYLog(@"已冻结，忽略后续写包 char=%@ HEX=%@", charUUID, YCYHexString(data));
@@ -532,7 +532,7 @@ static void YCYRecordWrite(CBPeripheral *peripheral,
         return;
     }
 
-    /* 重连后 2 秒内的写包视为握手，不记入开锁记录。 */
+    /* 连接后短窗口内的包视为握手，不记。官方开锁一般在连上之后由控方触发。 */
     if (gHandshakeUntil && [gHandshakeUntil timeIntervalSinceNow] > 0) {
         YCYLog(@"握手窗口内，跳过记录 char=%@ HEX=%@", charUUID, YCYHexString(data));
         lastLockUUID = peripheral.identifier;
@@ -548,7 +548,8 @@ static void YCYRecordWrite(CBPeripheral *peripheral,
     item.value = [data copy];
     item.type = type;
     item.time = [NSDate date];
-    item.unlockLike = YCYLooksLikeUnlockPayload(data);
+    /* 目标特征上的写一律视为会话有效包（含加密开锁帧） */
+    item.unlockLike = YES;
 
     lastLockUUID = peripheral.identifier;
     lastLockName = item.peripheralName;
@@ -568,18 +569,12 @@ static void YCYRecordWrite(CBPeripheral *peripheral,
     }
     if (!dup) {
         [liveSession addObject:item];
-        if (liveSession.count > 12) {
-            [liveSession removeObjectsInRange:NSMakeRange(0, liveSession.count - 12)];
+        if (liveSession.count > 16) {
+            [liveSession removeObjectsInRange:NSMakeRange(0, liveSession.count - 16)];
         }
     }
-    BOOL shouldPromote = NO;
-    for (YCYRecordedWrite *w in liveSession) {
-        if (YCYLooksLikeUnlockPayload(w.value) || YCYLooksLikeStrongUnlock(w.value)) {
-            shouldPromote = YES;
-            break;
-        }
-    }
-    if (shouldPromote) {
+    /* 只要 liveSession 有目标特征写包，就提升到 canonical（不再要求明文特征码） */
+    if (liveSession.count > 0) {
         [canonicalWrites removeAllObjects];
         [canonicalWrites addObjectsFromArray:liveSession];
     }
@@ -590,7 +585,7 @@ static void YCYRecordWrite(CBPeripheral *peripheral,
         YCYLog(@"★ 记录开锁包 #%lu name=%@ char=%@ HEX=%@",
                (unsigned long)count, item.peripheralName, item.charUUID, YCYHexString(data));
     }
-    if (shouldPromote) {
+    if (count > 0) {
         YCYScheduleFreeze();
         YCYPersistRecords();
     }
@@ -1568,7 +1563,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
 %ctor {
     YCYInitState();
     YCYLog(@"==============================");
-    YCYLog(@"YCYUnlock loaded v1.1.0");
+    YCYLog(@"YCYUnlock loaded v1.1.1");
     YCYLog(@"短按 = 开锁（未连接会自动搜 YS04）");
     YCYLog(@"长按 = 菜单 / 日志");
     YCYLog(@"开锁记录冻结后，关锁/重连不会覆盖");
