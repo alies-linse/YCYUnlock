@@ -1,17 +1,30 @@
 #import <UIKit/UIKit.h>
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <QuartzCore/QuartzCore.h>
+#import <JavaScriptCore/JavaScriptCore.h>
 #import <objc/runtime.h>
 
-#pragma mark - 常量（YS04）
+/*
+ * YCYUnlock v1.2.0
+ *
+ * YS04 写到 9001/AE01 的全部是 16 字节密文，明文 01 00 / 20 01 永远匹配不上。
+ * 心跳/关锁包（例如 BB B0 ...）会反复出现；真正的开锁包在一次官方开锁里通常只出现一次。
+ *
+ * v1.1 把整段会话（握手+心跳+开锁）一起重放 → 先开再关。
+ * v1.2 只冻结/重放「唯一密文」，心跳一律丢掉。短按优先走 App 内部 JS 开锁（当前会话密钥）。
+ */
+
+#pragma mark - 常量（YS04 / Walkiz）
 
 static NSString * const kYCYChar9001 = @"00009001-0000-1000-8000-57616C6B697A";
 static NSString * const kYCYCharAE01 = @"AE01";
 static NSString * const kYCYSvc9000  = @"00009000-0000-1000-8000-57616C6B697A";
 static NSString * const kYCYSvcAE00  = @"AE00";
-static NSString * const kYCYRecordsKey = @"YCYUnlock.canonicalWrites.v2";
+static NSString * const kYCYRecordsKey = @"YCYUnlock.canonicalWrites.v3";
+static NSString * const kYCYRecordsKeyV2 = @"YCYUnlock.canonicalWrites.v2";
 static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
+static NSString * const kYCYVersion = @"1.2.0";
 
 #pragma mark - 全局
 
@@ -27,6 +40,8 @@ static BOOL gIgnoreHookWrite = NO;
 static BOOL gUnlockInFlight = NO;
 static BOOL gCanonicalFrozen = NO;
 static BOOL gNeedsRediscover = NO;
+static BOOL gInJSProbe = NO;
+static BOOL gDumpedClasses = NO;
 static NSDate *gHandshakeUntil;
 
 static NSMutableDictionary<NSString *, CBPeripheral *> *peripheralsByUUID;
@@ -37,6 +52,7 @@ static NSString *lastLockName;
 static __weak CBPeripheral *lastAppPeripheral;
 static NSDate *lastAppWriteTime;
 static NSMutableSet<NSString *> *observedPeripheralIDs;
+static NSHashTable<JSContext *> *jsContexts;
 
 @interface YCYRecordedWrite : NSObject
 @property (nonatomic, copy) NSUUID *peripheralID;
@@ -47,6 +63,9 @@ static NSMutableSet<NSString *> *observedPeripheralIDs;
 @property (nonatomic, assign) CBCharacteristicWriteType type;
 @property (nonatomic, strong) NSDate *time;
 @property (nonatomic, assign) BOOL unlockLike;
+@property (nonatomic, assign) BOOL handshakeLike;
+@property (nonatomic, assign) BOOL heartbeatLike;
+@property (nonatomic, assign) NSUInteger seenCount;
 @end
 
 @implementation YCYRecordedWrite
@@ -54,6 +73,7 @@ static NSMutableSet<NSString *> *observedPeripheralIDs;
 
 static NSMutableArray<YCYRecordedWrite *> *canonicalWrites;
 static NSMutableArray<YCYRecordedWrite *> *liveSession;
+static NSMutableDictionary<NSString *, NSNumber *> *payloadCounts;
 static NSLock *recordLock;
 static dispatch_block_t gFreezeBlock;
 
@@ -62,6 +82,8 @@ static dispatch_block_t gFreezeBlock;
 static void YCYPersistRecords(void);
 static void YCYLoadRecords(void);
 static void YCYScheduleFloatingButton(void);
+static NSArray<YCYRecordedWrite *> *YCYUniqueUnlockPackets(NSArray<YCYRecordedWrite *> *burst);
+static void YCYReclassifyInPlace(NSMutableArray<YCYRecordedWrite *> *items);
 
 static void YCYInitState(void) {
     static dispatch_once_t onceToken;
@@ -70,13 +92,15 @@ static void YCYInitState(void) {
         bleLogLock = [[NSLock alloc] init];
         canonicalWrites = [NSMutableArray array];
         liveSession = [NSMutableArray array];
+        payloadCounts = [NSMutableDictionary dictionary];
         recordLock = [[NSLock alloc] init];
         peripheralsByUUID = [NSMutableDictionary dictionary];
         peripheralLock = [[NSLock alloc] init];
         observedPeripheralIDs = [NSMutableSet set];
+        jsContexts = [NSHashTable weakObjectsHashTable];
         YCYLoadRecords();
-        NSLog(@"[YCYUnlock] State initialized frozen=%d records=%lu",
-              gCanonicalFrozen, (unsigned long)canonicalWrites.count);
+        NSLog(@"[YCYUnlock] State initialized v%@ frozen=%d records=%lu",
+              kYCYVersion, gCanonicalFrozen, (unsigned long)canonicalWrites.count);
     });
 }
 
@@ -92,8 +116,8 @@ static void YCYLog(NSString *format, ...) {
 
     [bleLogLock lock];
     [bleLogs addObject:line];
-    if (bleLogs.count > 500) {
-        [bleLogs removeObjectsInRange:NSMakeRange(0, bleLogs.count - 500)];
+    if (bleLogs.count > 600) {
+        [bleLogs removeObjectsInRange:NSMakeRange(0, bleLogs.count - 600)];
     }
     [bleLogLock unlock];
 }
@@ -107,6 +131,12 @@ static NSString *YCYHexString(NSData *data) {
         if (i + 1 < data.length) [result appendString:@" "];
     }
     return result;
+}
+
+static NSString *YCYShortHex(NSData *data) {
+    NSString *hex = YCYHexString(data);
+    if (hex.length <= 24) return hex;
+    return [[hex substringToIndex:23] stringByAppendingString:@"…"];
 }
 
 static NSString *YCYUUIDString(NSUUID *uuid) {
@@ -158,10 +188,6 @@ static BOOL YCYIsTargetCharacteristic(NSString *uuid) {
     return NO;
 }
 
-/*
- * 强开锁特征：尽量只把真正的开锁帧当成“可冻结的官方开锁”。
- * 弱特征（01 00 / 20 01）握手、心跳、关锁都可能撞上，不能单独用来覆盖记录。
- */
 static BOOL YCYLooksLikeStrongUnlock(NSData *data) {
     if (!data || data.length < 3) return NO;
     const unsigned char *b = data.bytes;
@@ -187,6 +213,7 @@ static BOOL YCYLooksLikeLockName(NSString *name) {
     if ([n containsString:@"YS04"]) return YES;
     if ([n containsString:@"YS0"]) return YES;
     if ([n containsString:@"YISKJ"]) return YES;
+    if ([n containsString:@"WALKIZ"]) return YES;
     return NO;
 }
 
@@ -200,6 +227,28 @@ static NSString *YCYProperties(CBCharacteristic *characteristic) {
     if (p & CBCharacteristicPropertyNotify) [items addObject:@"Notify"];
     if (p & CBCharacteristicPropertyIndicate) [items addObject:@"Indicate"];
     return items.count ? [items componentsJoinedByString:@" | "] : @"None";
+}
+
+static void YCYDumpInterestingClasses(void) {
+    if (gDumpedClasses) return;
+    gDumpedClasses = YES;
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * (NSUInteger)n);
+    n = objc_getClassList(classes, n);
+    for (int i = 0; i < n; i++) {
+        NSString *name = NSStringFromClass(classes[i]);
+        if ([name localizedCaseInsensitiveContainsString:@"BLE"] ||
+            [name localizedCaseInsensitiveContainsString:@"Bluetooth"] ||
+            [name localizedCaseInsensitiveContainsString:@"DCBLE"] ||
+            [name localizedCaseInsensitiveContainsString:@"Lock"] ||
+            [name localizedCaseInsensitiveContainsString:@"JSEngine"] ||
+            [name localizedCaseInsensitiveContainsString:@"JSContext"]) {
+            if ([name hasPrefix:@"NS"] || [name hasPrefix:@"UI"] || [name hasPrefix:@"CB"]) continue;
+            YCYLog(@"class %@", name);
+        }
+    }
+    free(classes);
 }
 
 #pragma mark - 外设池
@@ -367,6 +416,52 @@ static void YCYSetButtonBusy(BOOL busy) {
     });
 }
 
+#pragma mark - 分类：唯一密文 vs 心跳
+
+static void YCYReclassifyInPlace(NSMutableArray<YCYRecordedWrite *> *items) {
+    /* liveSession 会把相同 HEX 折叠成一条，所以不能再按数组出现次数判断。
+     * 以 seenCount（含被折叠的重复次数）为准。 */
+    for (YCYRecordedWrite *w in items) {
+        if (w.seenCount >= 2) {
+            w.heartbeatLike = YES;
+            w.unlockLike = NO;
+        } else if (!w.handshakeLike) {
+            w.heartbeatLike = NO;
+        }
+        if (YCYLooksLikeUnlockPayload(w.value) || YCYLooksLikeStrongUnlock(w.value)) {
+            w.unlockLike = YES;
+            w.heartbeatLike = NO;
+        }
+    }
+}
+
+static NSArray<YCYRecordedWrite *> *YCYUniqueUnlockPackets(NSArray<YCYRecordedWrite *> *burst) {
+    if (burst.count == 0) return @[];
+
+    NSMutableArray *strong = [NSMutableArray array];
+    for (YCYRecordedWrite *item in burst) {
+        if (YCYLooksLikeStrongUnlock(item.value)) [strong addObject:item];
+    }
+    if (strong.count) return strong;
+
+    NSMutableArray *unique = [NSMutableArray array];
+    for (YCYRecordedWrite *item in burst) {
+        if (item.handshakeLike) continue;
+        if (item.heartbeatLike || item.seenCount >= 2) continue;
+        [unique addObject:item];
+    }
+    if (unique.count == 0) return @[];
+
+    /* 同一突发里可能混入手握后的第一条状态包。只保留最后一簇（官方点开锁通常是最后的动作）。 */
+    YCYRecordedWrite *last = unique.lastObject;
+    NSMutableArray *tail = [NSMutableArray array];
+    for (YCYRecordedWrite *w in unique) {
+        NSTimeInterval dt = last.time && w.time ? [last.time timeIntervalSinceDate:w.time] : 0;
+        if (dt <= 0.85) [tail addObject:w];
+    }
+    return tail.count ? tail : unique;
+}
+
 #pragma mark - 持久化
 
 static NSDictionary *YCYWriteToDict(YCYRecordedWrite *item) {
@@ -379,6 +474,9 @@ static NSDictionary *YCYWriteToDict(YCYRecordedWrite *item) {
         @"type": @(item.type),
         @"time": @([item.time timeIntervalSince1970]),
         @"unlockLike": @(item.unlockLike),
+        @"handshakeLike": @(item.handshakeLike),
+        @"heartbeatLike": @(item.heartbeatLike),
+        @"seenCount": @(item.seenCount),
     };
 }
 
@@ -399,6 +497,9 @@ static YCYRecordedWrite *YCYWriteFromDict(NSDictionary *d) {
     item.type = [d[@"type"] integerValue];
     item.time = [NSDate dateWithTimeIntervalSince1970:[d[@"time"] doubleValue]];
     item.unlockLike = [d[@"unlockLike"] boolValue];
+    item.handshakeLike = [d[@"handshakeLike"] boolValue];
+    item.heartbeatLike = [d[@"heartbeatLike"] boolValue];
+    item.seenCount = [d[@"seenCount"] unsignedIntegerValue];
     if (!item.value) return nil;
     return item;
 }
@@ -425,18 +526,36 @@ static void YCYPersistRecords(void) {
 static void YCYLoadRecords(void) {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     NSArray *arr = [ud arrayForKey:kYCYRecordsKey];
+    if (arr.count == 0) {
+        arr = [ud arrayForKey:kYCYRecordsKeyV2];
+    }
     [canonicalWrites removeAllObjects];
     for (NSDictionary *d in arr) {
         YCYRecordedWrite *item = YCYWriteFromDict(d);
         if (item) [canonicalWrites addObject:item];
     }
-    gCanonicalFrozen = [ud boolForKey:@"YCYUnlock.frozen"] && canonicalWrites.count > 0;
-    if (canonicalWrites.count > 0 && !gCanonicalFrozen) {
-        for (YCYRecordedWrite *w in canonicalWrites) {
-            if (w.unlockLike || YCYLooksLikeUnlockPayload(w.value)) {
-                gCanonicalFrozen = YES;
-                break;
-            }
+    YCYReclassifyInPlace(canonicalWrites);
+    BOOL hasFreq = NO;
+    for (YCYRecordedWrite *w in canonicalWrites) {
+        if (w.seenCount >= 1 || w.heartbeatLike) { hasFreq = YES; break; }
+    }
+    if (!hasFreq && canonicalWrites.count > 1) {
+        /* v1.1 存的是整段会话且没有频率，无法区分心跳。丢掉以免继续「先开再关」。 */
+        NSLog(@"[YCYUnlock] 旧记录没有频率信息，已丢弃 %lu 条，请重新官方开锁一次",
+              (unsigned long)canonicalWrites.count);
+        [canonicalWrites removeAllObjects];
+        gCanonicalFrozen = NO;
+    } else {
+        NSArray *unique = YCYUniqueUnlockPackets(canonicalWrites);
+        if (unique.count > 0 && unique.count < canonicalWrites.count) {
+            NSLog(@"[YCYUnlock] 加载后剔除心跳 %lu → 唯一 %lu",
+                  (unsigned long)canonicalWrites.count, (unsigned long)unique.count);
+            [canonicalWrites removeAllObjects];
+            [canonicalWrites addObjectsFromArray:unique];
+        }
+        gCanonicalFrozen = [ud boolForKey:@"YCYUnlock.frozen"] && canonicalWrites.count > 0;
+        if (canonicalWrites.count > 0 && unique.count > 0) {
+            gCanonicalFrozen = YES;
         }
     }
     NSString *uuid = [ud stringForKey:kYCYLockUUIDKey];
@@ -453,44 +572,35 @@ static NSArray<YCYRecordedWrite *> *YCYCanonicalCopy(void) {
     return all;
 }
 
-/*
- * YS04 实际写到 9001 的是 16 字节加密帧，对不上明文特征码。
- * 重放时：优先明文强特征；否则整段突发原样重放（加密锁的正确做法）。
- */
-static NSArray<YCYRecordedWrite *> *YCYReplayPackets(NSArray<YCYRecordedWrite *> *burst) {
-    NSMutableArray *strong = [NSMutableArray array];
-    for (YCYRecordedWrite *item in burst) {
-        if (YCYLooksLikeStrongUnlock(item.value)) {
-            [strong addObject:item];
-        }
-    }
-    if (strong.count) return strong;
-    return burst;
-}
-
 static void YCYFreezeCanonicalFromSession(void) {
     [recordLock lock];
-    if (liveSession.count == 0 && canonicalWrites.count == 0) {
-        [recordLock unlock];
-        return;
-    }
-    if (liveSession.count > 0) {
+    YCYReclassifyInPlace(liveSession);
+    NSArray *unique = YCYUniqueUnlockPackets(liveSession);
+    BOOL didFreeze = NO;
+    if (unique.count > 0) {
         [canonicalWrites removeAllObjects];
-        [canonicalWrites addObjectsFromArray:liveSession];
+        [canonicalWrites addObjectsFromArray:unique];
         for (YCYRecordedWrite *w in canonicalWrites) {
             w.unlockLike = YES;
+            w.heartbeatLike = NO;
         }
-    }
-    if (canonicalWrites.count > 0) {
         gCanonicalFrozen = YES;
-        YCYLog(@"★ 冻结开锁记录 %lu 条（关锁/重连握手不再覆盖）",
+        didFreeze = YES;
+        YCYLog(@"★ 冻结唯一开锁包 %lu 条（已丢弃心跳/重复，关锁不再覆盖）",
                (unsigned long)canonicalWrites.count);
+        for (YCYRecordedWrite *w in canonicalWrites) {
+            YCYLog(@"  冻结 HEX=%@", YCYHexString(w.value));
+        }
+    } else {
+        YCYLog(@"冻结跳过：当前会话没有唯一密文（可能还没官方开锁） live=%lu",
+               (unsigned long)liveSession.count);
     }
     [recordLock unlock];
-    if (gCanonicalFrozen) YCYPersistRecords();
+    if (didFreeze) YCYPersistRecords();
 }
 
 static void YCYScheduleFreeze(void) {
+    if (gCanonicalFrozen) return;
     if (gFreezeBlock) {
         dispatch_block_cancel(gFreezeBlock);
         gFreezeBlock = nil;
@@ -500,8 +610,8 @@ static void YCYScheduleFreeze(void) {
         if (!gCanonicalFrozen) YCYFreezeCanonicalFromSession();
     });
     gFreezeBlock = block;
-    /* 官方开锁突发通常 1 秒内结束；停笔 1.8s 后冻结，避免把后续关锁包混进来 */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
+    /* 官方开锁通常 1 秒内结束。停笔 1.6s 后按频率分类：重复=心跳，唯一=开锁。 */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), block);
 }
 
@@ -520,21 +630,24 @@ static void YCYRecordWrite(CBPeripheral *peripheral,
     BOOL target = YCYIsTargetCharacteristic(charUUID) || YCYLooksLikeUnlockPayload(data);
     if (!target) return;
 
-    /*
-     * YS04 开锁帧是 16 字节密文，不能再靠 05 01 / AF 0F 等明文特征判断。
-     * 策略：凡写到 9001/AE01 的包都进 liveSession，并提升到 canonical；
-     * 突发结束后冻结，之后关锁/握手不再覆盖。
-     */
+    NSString *hex = YCYHexString(data);
+    BOOL inHandshake = (gHandshakeUntil && [gHandshakeUntil timeIntervalSinceNow] > 0);
+
+    [recordLock lock];
+    NSInteger seen = [payloadCounts[hex] integerValue] + 1;
+    payloadCounts[hex] = @(seen);
+    [recordLock unlock];
+
     if (gCanonicalFrozen) {
-        YCYLog(@"已冻结，忽略后续写包 char=%@ HEX=%@", charUUID, YCYHexString(data));
+        YCYLog(@"已冻结，忽略写包 unique=%@ count=%ld HEX=%@",
+               seen == 1 ? @"YES" : @"NO", (long)seen, hex);
         lastLockUUID = peripheral.identifier;
         lastLockName = YCYPeripheralName(peripheral);
         return;
     }
 
-    /* 连接后短窗口内的包视为握手，不记。官方开锁一般在连上之后由控方触发。 */
-    if (gHandshakeUntil && [gHandshakeUntil timeIntervalSinceNow] > 0) {
-        YCYLog(@"握手窗口内，跳过记录 char=%@ HEX=%@", charUUID, YCYHexString(data));
+    if (inHandshake) {
+        YCYLog(@"握手窗口，跳过记录 count=%ld HEX=%@", (long)seen, hex);
         lastLockUUID = peripheral.identifier;
         lastLockName = YCYPeripheralName(peripheral);
         return;
@@ -548,15 +661,17 @@ static void YCYRecordWrite(CBPeripheral *peripheral,
     item.value = [data copy];
     item.type = type;
     item.time = [NSDate date];
-    /* 目标特征上的写一律视为会话有效包（含加密开锁帧） */
-    item.unlockLike = YES;
+    item.handshakeLike = NO;
+    item.seenCount = (NSUInteger)seen;
+    item.heartbeatLike = (seen >= 2);
+    item.unlockLike = (!item.heartbeatLike);
 
     lastLockUUID = peripheral.identifier;
     lastLockName = item.peripheralName;
 
     [recordLock lock];
     YCYRecordedWrite *last = liveSession.lastObject;
-    if (last && [item.time timeIntervalSinceDate:last.time] > 8.0) {
+    if (last && [item.time timeIntervalSinceDate:last.time] > 12.0) {
         [liveSession removeAllObjects];
     }
     BOOL dup = NO;
@@ -565,29 +680,30 @@ static void YCYRecordWrite(CBPeripheral *peripheral,
         if ([prev.charUUID isEqualToString:item.charUUID] &&
             [prev.value isEqualToData:item.value]) {
             dup = YES;
+            prev.seenCount = (NSUInteger)seen;
+            prev.heartbeatLike = YES;
+            prev.unlockLike = NO;
         }
     }
     if (!dup) {
         [liveSession addObject:item];
-        if (liveSession.count > 16) {
-            [liveSession removeObjectsInRange:NSMakeRange(0, liveSession.count - 16)];
+        if (liveSession.count > 20) {
+            [liveSession removeObjectsInRange:NSMakeRange(0, liveSession.count - 20)];
         }
     }
-    /* 只要 liveSession 有目标特征写包，就提升到 canonical（不再要求明文特征码） */
-    if (liveSession.count > 0) {
-        [canonicalWrites removeAllObjects];
-        [canonicalWrites addObjectsFromArray:liveSession];
-    }
-    NSUInteger count = canonicalWrites.count;
+    NSUInteger liveCount = liveSession.count;
     [recordLock unlock];
 
-    if (!dup) {
-        YCYLog(@"★ 记录开锁包 #%lu name=%@ char=%@ HEX=%@",
-               (unsigned long)count, item.peripheralName, item.charUUID, YCYHexString(data));
-    }
-    if (count > 0) {
+    YCYLog(@"★ 记录 %@ count=%ld live=%lu char=%@ HEX=%@",
+           item.heartbeatLike ? @"心跳/重复" : @"唯一候选",
+           (long)seen,
+           (unsigned long)liveCount,
+           charUUID,
+           hex);
+
+    /* 有唯一候选才安排冻结；纯心跳不冻结 */
+    if (!item.heartbeatLike) {
         YCYScheduleFreeze();
-        YCYPersistRecords();
     }
 }
 
@@ -662,14 +778,19 @@ static void YCYFinishUnlockFlight(void) {
 }
 
 static NSInteger YCYReplayBurstOnPeripheral(NSArray<YCYRecordedWrite *> *burst, CBPeripheral *forced) {
-    if (burst.count == 0) {
+    NSArray<YCYRecordedWrite *> *packets = YCYUniqueUnlockPackets(burst);
+    if (packets.count == 0) {
+        YCYLog(@"重放取消：没有唯一开锁包（避免把心跳当开锁） recorded=%lu",
+               (unsigned long)burst.count);
         YCYFinishUnlockFlight();
         return 0;
     }
 
-    NSArray<YCYRecordedWrite *> *packets = YCYReplayPackets(burst);
-    YCYLog(@"开始重放 packets=%lu / recorded=%lu needsRediscover=%d",
+    YCYLog(@"开始重放唯一包 packets=%lu / recorded=%lu needsRediscover=%d",
            (unsigned long)packets.count, (unsigned long)burst.count, gNeedsRediscover);
+    for (YCYRecordedWrite *p in packets) {
+        YCYLog(@"  将发送 HEX=%@", YCYHexString(p.value));
+    }
 
     gIgnoreHookWrite = YES;
     YCYEnableNotifies(forced);
@@ -700,7 +821,7 @@ static NSInteger YCYReplayBurstOnPeripheral(NSArray<YCYRecordedWrite *> *burst, 
         if (YCYWriteData(target, ch, item.value, item.type)) sent++;
     };
 
-    NSTimeInterval gap = 0.14;
+    NSTimeInterval gap = 0.18;
     for (NSUInteger i = 0; i < packets.count; i++) {
         YCYRecordedWrite *item = packets[i];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * gap * NSEC_PER_SEC)),
@@ -709,21 +830,83 @@ static NSInteger YCYReplayBurstOnPeripheral(NSArray<YCYRecordedWrite *> *burst, 
         });
     }
 
-    /* 末包再补一次，应对 WriteWithoutResponse 在重连后偶发丢失；不会把整段突发连放三遍。 */
-    YCYRecordedWrite *lastPkt = packets.lastObject;
-    NSTimeInterval extraAt = packets.count * gap + 0.28;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(extraAt * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (lastPkt) sendOne(lastPkt);
-    });
+    /* 只有 1 条唯一开锁包时，隔 0.28s 再发同一条（WriteWithoutResponse 丢包）。
+     * 绝不再把「整段突发的末包」补发一遍——末包经常是心跳/关锁。 */
+    NSTimeInterval extraAt = packets.count * gap;
+    if (packets.count == 1) {
+        YCYRecordedWrite *only = packets.firstObject;
+        extraAt += 0.28;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(extraAt * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            sendOne(only);
+        });
+    }
 
-    NSTimeInterval total = extraAt + 0.7;
+    NSTimeInterval total = extraAt + 0.6;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(total * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         YCYLog(@"重放结束 sent≈%ld", (long)sent);
         YCYFinishUnlockFlight();
     });
     return (NSInteger)packets.count;
+}
+
+#pragma mark - JSContext（UniApp service 层）
+
+static void YCYRememberJSContext(JSContext *ctx) {
+    if (!ctx || gInJSProbe) return;
+    YCYInitState();
+    @synchronized (jsContexts) {
+        [jsContexts addObject:ctx];
+    }
+    static BOOL probed = NO;
+    if (probed) return;
+    probed = YES;
+    gInJSProbe = YES;
+    @try {
+        JSValue *v = [ctx evaluateScript:
+            @"(function(){var a=[];try{"
+            "if(typeof _ble_do==='function')a.push('_ble_do');"
+            "if(typeof _init_ble==='function')a.push('_init_ble');"
+            "if(typeof plus!=='undefined')a.push('plus');"
+            "if(typeof uni!=='undefined')a.push('uni');"
+            "if(typeof getApp==='function')a.push('getApp');"
+            "}catch(e){}return a.join(',')||'none';})()"];
+        YCYLog(@"JSContext probe globals=%@", v.isString ? v.toString : @"?");
+    } @catch (NSException *ex) {
+        YCYLog(@"JS probe 异常: %@", ex.reason);
+    }
+    gInJSProbe = NO;
+}
+
+static BOOL YCYTryJSOpen(void) {
+    NSArray *ctxs;
+    @synchronized (jsContexts) {
+        ctxs = [[jsContexts allObjects] copy];
+    }
+    if (ctxs.count == 0) {
+        YCYLog(@"无 JSContext，跳过 App 内部开锁");
+        return NO;
+    }
+    NSString *script =
+        @"(function(){try{"
+        "if(typeof _ble_do==='function'){_ble_do('open');return 'opened:_ble_do';}"
+        "return 'miss';"
+        "}catch(e){return 'err:'+String(e);}})()";
+    gInJSProbe = YES;
+    BOOL opened = NO;
+    for (JSContext *ctx in ctxs) {
+        @try {
+            JSValue *v = [ctx evaluateScript:script];
+            NSString *s = v.isString ? v.toString : @"nil";
+            YCYLog(@"JS open result=%@", s);
+            if ([s hasPrefix:@"opened:"]) opened = YES;
+        } @catch (NSException *ex) {
+            YCYLog(@"JS open 异常: %@", ex.reason);
+        }
+    }
+    gInJSProbe = NO;
+    return opened;
 }
 
 #pragma mark - 自建 BLE 连接
@@ -763,7 +946,11 @@ static YCYBleEngine *gEngine;
     self.busy = NO;
     [self.central stopScan];
     NSInteger n = YCYReplayBurstOnPeripheral(self.pendingBurst, peripheral);
-    YCYShowToast([NSString stringWithFormat:@"已连接，正在重放 %ld 条指令", (long)n]);
+    if (n <= 0) {
+        YCYShowToast(@"已连接，但没有唯一开锁包\n请先官方开锁一次");
+    } else {
+        YCYShowToast([NSString stringWithFormat:@"已连接，正在重放 %ld 条唯一指令", (long)n]);
+    }
 }
 
 - (BOOL)hasWriteChars:(CBPeripheral *)p {
@@ -773,12 +960,7 @@ static YCYBleEngine *gEngine;
 - (void)discoverOn:(CBPeripheral *)peripheral {
     self.target = peripheral;
     peripheral.delegate = self;
-    YCYLog(@"开始发现服务（强制刷新，不信任缓存） %@", YCYPeripheralName(peripheral));
-    /*
-     * 重连后 retrieve 回来的 CBPeripheral 往往还挂着上一次的 services，
-     * 那些特征已经失效，直接 write 会静默失败：界面显示已连接+正在重放，锁却不动。
-     * 所以这里永远重新 discover，禁止走缓存短路径。
-     */
+    YCYLog(@"开始发现服务（强制刷新） %@", YCYPeripheralName(peripheral));
     NSArray *svcs = @[
         [CBUUID UUIDWithString:kYCYSvc9000],
         [CBUUID UUIDWithString:kYCYSvcAE00]
@@ -836,13 +1018,6 @@ static YCYBleEngine *gEngine;
     if (lastLockUUID) [ids addObject:lastLockUUID];
     for (YCYRecordedWrite *w in self.pendingBurst) {
         if (w.peripheralID) [ids addObject:w.peripheralID];
-    }
-
-    if (appCentral) {
-        YCYLog(@"appCentral state=%ld", (long)appCentral.state);
-    }
-    if (lastLockName) {
-        YCYLog(@"lastLock name=%@", lastLockName);
     }
 
     NSArray *svcs = @[
@@ -999,27 +1174,52 @@ didUpdateValueForCharacteristic:(CBCharacteristic *)characteristic
 
 static void YCYDoReplay(NSArray *burst, CBPeripheral *ready) {
     NSInteger n = YCYReplayBurstOnPeripheral(burst, ready);
-    YCYShowToast([NSString stringWithFormat:@"正在重放 %ld 条指令", (long)n]);
+    if (n <= 0) {
+        YCYShowToast(@"没有唯一开锁包\n请先让控方同意并成功开锁一次");
+    } else {
+        YCYShowToast([NSString stringWithFormat:@"正在重放 %ld 条唯一指令", (long)n]);
+    }
 }
 
-static void YCYTryUnlock(void) {
+static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
     YCYInitState();
     if (gUnlockInFlight) {
         YCYShowToast(@"正在开锁，请稍候");
         return;
     }
 
-    NSArray *burst = YCYCanonicalCopy();
+    if (!gCanonicalFrozen) {
+        YCYFreezeCanonicalFromSession();
+    }
+
+    NSArray *effective = burst;
+    if (effective.count == 0) {
+        effective = YCYUniqueUnlockPackets(YCYCanonicalCopy());
+    } else {
+        NSArray *filtered = YCYUniqueUnlockPackets(effective);
+        if (filtered.count) effective = filtered;
+    }
+
     NSArray *connected = YCYConnectedPeripherals();
-
-    YCYLog(@"尝试开锁 connected=%lu canonical=%lu frozen=%d needsRediscover=%d",
+    YCYLog(@"尝试开锁 connected=%lu unique=%lu frozen=%d js=%d",
            (unsigned long)connected.count,
-           (unsigned long)burst.count,
+           (unsigned long)effective.count,
            gCanonicalFrozen,
-           gNeedsRediscover);
+           tryJS);
 
-    if (burst.count == 0) {
-        YCYShowToast(@"还没有记录到开锁指令\n请先让控方同意并成功开锁一次");
+    if (tryJS && YCYTryJSOpen()) {
+        gUnlockInFlight = YES;
+        YCYSetButtonBusy(YES);
+        YCYShowToast(@"已调用 App 内部开锁接口");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            YCYFinishUnlockFlight();
+        });
+        return;
+    }
+
+    if (effective.count == 0) {
+        YCYShowToast(@"还没有唯一开锁包\n请先让控方同意并成功开锁一次\n心跳包不会被当成开锁");
         return;
     }
 
@@ -1033,14 +1233,13 @@ static void YCYTryUnlock(void) {
         NSTimeInterval sinceWrite = lastAppWriteTime
             ? -[lastAppWriteTime timeIntervalSinceNow]
             : 999;
-        BOOL recentlyWritten = sinceWrite < 8.0;
+        BOOL recentlyWritten = sinceWrite < 12.0;
 
         if (hasChars && !gNeedsRediscover && recentlyWritten) {
-            YCYDoReplay(burst, ready);
+            YCYDoReplay(effective, ready);
             return;
         }
 
-        /* 关锁/重连后特征可能是缓存，先让 App 侧对象重新发现再写。 */
         YCYLog(@"已连接但需刷新服务 hasChars=%d needsRediscover=%d sinceWrite=%.1f",
                hasChars, gNeedsRediscover, sinceWrite);
         YCYShowToast(@"锁盒已连接，正在刷新服务…");
@@ -1051,7 +1250,7 @@ static void YCYTryUnlock(void) {
             CBPeripheral *p = weakP;
             if (!p || p.state != CBPeripheralStateConnected) {
                 YCYShowToast(@"锁盒未连接，正在自动搜索 YS04…");
-                [[YCYBleEngine shared] beginWithBurst:burst];
+                [[YCYBleEngine shared] beginWithBurst:effective];
                 return;
             }
             if (p.services.count == 0) {
@@ -1066,10 +1265,10 @@ static void YCYTryUnlock(void) {
                 if (p2 && p2.state == CBPeripheralStateConnected &&
                     YCYWriteCharacteristics(p2).count > 0) {
                     gNeedsRediscover = NO;
-                    YCYDoReplay(burst, p2);
+                    YCYDoReplay(effective, p2);
                 } else {
                     YCYShowToast(@"锁盒未连接，正在自动搜索 YS04…");
-                    [[YCYBleEngine shared] beginWithBurst:burst];
+                    [[YCYBleEngine shared] beginWithBurst:effective];
                 }
             });
         });
@@ -1077,10 +1276,14 @@ static void YCYTryUnlock(void) {
     }
 
     YCYShowToast(@"锁盒未连接，正在自动搜索 YS04…");
-    [[YCYBleEngine shared] beginWithBurst:burst];
+    [[YCYBleEngine shared] beginWithBurst:effective];
 }
 
-#pragma mark - 日志 UI
+static void YCYTryUnlock(void) {
+    YCYTryUnlockWithBurst(nil, YES);
+}
+
+#pragma mark - 日志 / 记录 UI
 
 static void YCYShowLogs(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1104,29 +1307,46 @@ static void YCYShowLogs(void) {
 static void YCYShowRecords(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSArray *all = YCYCanonicalCopy();
+        NSArray *unique = YCYUniqueUnlockPackets(all);
         NSMutableString *text = [NSMutableString string];
         if (all.count == 0) {
-            [text appendString:@"暂无已记录的开锁指令\n请先让控方正常同意并成功开锁一次"];
+            [text appendString:@"暂无已记录的开锁指令\n请先让控方正常同意并成功开锁一次\n插件只会保存「只出现一次」的密文，心跳会被丢掉"];
         } else {
-            [text appendFormat:@"状态：%@\n\n", gCanonicalFrozen ? @"已冻结（关锁不会覆盖）" : @"采集中"];
+            [text appendFormat:@"状态：%@\n唯一包：%lu  原始：%lu\n\n",
+             gCanonicalFrozen ? @"已冻结（只重放唯一包）" : @"采集中",
+             (unsigned long)unique.count,
+             (unsigned long)all.count];
             NSInteger i = 1;
-            for (YCYRecordedWrite *item in all) {
-                [text appendFormat:@"%ld. %@ char=%@ len=%lu%@\n%@\n\n",
+            for (YCYRecordedWrite *item in unique.count ? unique : all) {
+                [text appendFormat:@"%ld. %@ %@\n%@\n\n",
                  (long)i++,
+                 item.heartbeatLike ? @"[心跳]" : @"[唯一]",
                  item.peripheralName,
-                 item.charUUID,
-                 (unsigned long)item.value.length,
-                 item.unlockLike ? @"  [开锁]" : @"",
                  YCYHexString(item.value)];
             }
         }
 
         UIAlertController *alert =
-            [UIAlertController alertControllerWithTitle:@"已记录指令（仅一次官方开锁）"
+            [UIAlertController alertControllerWithTitle:@"已记录的唯一开锁包"
                                                 message:text
                                          preferredStyle:UIAlertControllerStyleAlert];
+
+        NSInteger idx = 0;
+        for (YCYRecordedWrite *item in unique) {
+            if (idx >= 4) break;
+            NSString *title = [NSString stringWithFormat:@"重放第 %ld 条 %@",
+                               (long)(idx + 1), YCYShortHex(item.value)];
+            YCYRecordedWrite *captured = item;
+            [alert addAction:[UIAlertAction actionWithTitle:title
+                                                      style:UIAlertActionStyleDestructive
+                                                    handler:^(UIAlertAction *a) {
+                (void)a;
+                YCYTryUnlockWithBurst(@[captured], NO);
+            }]];
+            idx++;
+        }
         [alert addAction:[UIAlertAction actionWithTitle:@"关闭"
-                                                  style:UIAlertActionStyleDefault
+                                                  style:UIAlertActionStyleCancel
                                                 handler:nil]];
         [YCYTopVC() presentViewController:alert animated:YES completion:nil];
     });
@@ -1155,14 +1375,16 @@ static void YCYClearRecords(void) {
     [recordLock lock];
     [canonicalWrites removeAllObjects];
     [liveSession removeAllObjects];
+    [payloadCounts removeAllObjects];
     gCanonicalFrozen = NO;
     [recordLock unlock];
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     [ud removeObjectForKey:kYCYRecordsKey];
+    [ud removeObjectForKey:kYCYRecordsKeyV2];
     [ud setBool:NO forKey:@"YCYUnlock.frozen"];
     [ud synchronize];
-    YCYLog(@"Records cleared");
-    YCYShowToast(@"已清空记录的开锁指令");
+    YCYLog(@"Records cleared — 等待下一次官方开锁以捕获唯一包");
+    YCYShowToast(@"已清空。请让控方再开锁一次\n插件只会保存唯一密文");
 }
 
 #pragma mark - 悬浮窗
@@ -1180,9 +1402,12 @@ static void YCYClearRecords(void) {
 
 static void YCYShowMenu(UIButton *sender) {
     NSArray *canon = YCYCanonicalCopy();
+    NSArray *unique = YCYUniqueUnlockPackets(canon);
     NSString *msg = [NSString stringWithFormat:
-        @"短按：开锁（未连接会自动搜 YS04）\n长按：本菜单\n监控：%@   记录：%lu 条%@\n已连接：%lu",
+        @"短按：开锁（JS 优先，否则重放唯一密文）\n长按：本菜单\nv%@  监控：%@\n唯一包：%lu  原始：%lu%@\n已连接：%lu",
+        kYCYVersion,
         monitorEnabled ? @"开" : @"关",
+        (unsigned long)unique.count,
         (unsigned long)canon.count,
         gCanonicalFrozen ? @"（已冻结）" : @"",
         (unsigned long)YCYConnectedPeripherals().count];
@@ -1192,11 +1417,27 @@ static void YCYShowMenu(UIButton *sender) {
                                             message:msg
                                      preferredStyle:UIAlertControllerStyleActionSheet];
 
-    [menu addAction:[UIAlertAction actionWithTitle:@"立即开锁"
+    [menu addAction:[UIAlertAction actionWithTitle:@"立即开锁（JS+唯一包）"
                                              style:UIAlertActionStyleDestructive
                                            handler:^(UIAlertAction *a) {
                                                (void)a;
-                                               YCYTryUnlock();
+                                               YCYTryUnlockWithBurst(nil, YES);
+                                           }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"仅重放唯一 BLE 包"
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) {
+                                               (void)a;
+                                               YCYTryUnlockWithBurst(nil, NO);
+                                           }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"仅触发 App 内部开锁"
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) {
+                                               (void)a;
+                                               if (YCYTryJSOpen()) {
+                                                   YCYShowToast(@"已调用 App 内部开锁接口");
+                                               } else {
+                                                   YCYShowToast(@"没找到 _ble_do，请看日志里的 JS probe");
+                                               }
                                            }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"查看已记录指令"
                                              style:UIAlertActionStyleDefault
@@ -1222,7 +1463,7 @@ static void YCYShowMenu(UIButton *sender) {
                                                (void)a;
                                                YCYClearLogs();
                                            }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"清空开锁记录"
+    [menu addAction:[UIAlertAction actionWithTitle:@"重新捕获（清空后等官方开锁）"
                                              style:UIAlertActionStyleDefault
                                            handler:^(UIAlertAction *a) {
                                                (void)a;
@@ -1301,6 +1542,7 @@ static void YCYShowMenu(UIButton *sender) {
     }
     if (state == CBPeripheralStateConnected) {
         gNeedsRediscover = YES;
+        gHandshakeUntil = [NSDate dateWithTimeIntervalSinceNow:2.4];
     }
 }
 
@@ -1418,7 +1660,7 @@ static void YCYScheduleFloatingButton(void) {
                   options:(NSDictionary<NSString *,id> *)options {
     YCYRememberPeripheral(peripheral);
     gNeedsRediscover = YES;
-    gHandshakeUntil = [NSDate dateWithTimeIntervalSinceNow:2.0];
+    gHandshakeUntil = [NSDate dateWithTimeIntervalSinceNow:2.4];
     if (![self.delegate isKindOfClass:[YCYBleEngine class]]) {
         appCentral = self;
     }
@@ -1529,6 +1771,22 @@ static void YCYScheduleFloatingButton(void) {
 
 %end
 
+#pragma mark - JSContext
+
+%hook JSContext
+
+- (JSValue *)evaluateScript:(NSString *)script {
+    YCYRememberJSContext(self);
+    return %orig;
+}
+
+- (JSValue *)evaluateScript:(NSString *)script withSourceURL:(NSURL *)sourceURL {
+    YCYRememberJSContext(self);
+    return %orig;
+}
+
+%end
+
 #pragma mark - App 生命周期
 
 %hook UIApplication
@@ -1537,6 +1795,10 @@ static void YCYScheduleFloatingButton(void) {
 didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"didFinishLaunching");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        YCYDumpInterestingClasses();
+    });
     BOOL result = %orig(application, launchOptions);
     YCYScheduleFloatingButton();
     return result;
@@ -1563,10 +1825,10 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
 %ctor {
     YCYInitState();
     YCYLog(@"==============================");
-    YCYLog(@"YCYUnlock loaded v1.1.1");
-    YCYLog(@"短按 = 开锁（未连接会自动搜 YS04）");
-    YCYLog(@"长按 = 菜单 / 日志");
-    YCYLog(@"开锁记录冻结后，关锁/重连不会覆盖");
+    YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
+    YCYLog(@"只重放唯一密文，心跳/关锁包会被丢掉");
+    YCYLog(@"短按 = JS 开锁优先，否则重放唯一包");
+    YCYLog(@"长按 = 菜单 / 单条重放 / 重新捕获");
     YCYLog(@"==============================");
     YCYScheduleFloatingButton();
 }
