@@ -5,7 +5,7 @@
 #import <objc/runtime.h>
 
 /*
- * YCYUnlock v1.3.1
+ * YCYUnlock v1.3.2
  *
  * 日志结论（断电失败）：
  * - 握手是：WRITE 13 35…（跨会话不变）→ NOTIFY 挑战 → WRITE 4B 58… + 9B 17…（会话密文）
@@ -21,6 +21,9 @@
  * - 会话代际 gSessionGen 改为「握手完成（NOTIFY 挑战到达）」时递增
  * - 新增 gSessionKeyReady 标志，sameSession 判断必须密钥就绪
  * - DCBLEManager 开锁方法增加模糊匹配回退
+ *
+ * v1.3.2 修复：
+ * - 前向声明 YCYRememberPeripheral / YCYShowToast，修复 Xcode 15 隐式函数声明报错
  */
 
 #pragma mark - 常量（YS04 / Walkiz）
@@ -33,7 +36,7 @@ static NSString * const kYCYRecordsKey = @"YCYUnlock.canonicalWrites.v3";
 static NSString * const kYCYRecordsKeyV2 = @"YCYUnlock.canonicalWrites.v2";
 static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
-static NSString * const kYCYVersion = @"1.3.1";
+static NSString * const kYCYVersion = @"1.3.2";
 
 #pragma mark - 全局
 
@@ -92,7 +95,7 @@ static NSMutableDictionary<NSString *, NSNumber *> *payloadCounts;
 static NSLock *recordLock;
 static dispatch_block_t gFreezeBlock;
 
-#pragma mark - 工具
+#pragma mark - 前向声明
 
 static void YCYPersistRecords(void);
 static void YCYLoadRecords(void);
@@ -100,6 +103,17 @@ static void YCYScheduleFloatingButton(void);
 static NSArray<YCYRecordedWrite *> *YCYUniqueUnlockPackets(NSArray<YCYRecordedWrite *> *burst);
 static void YCYReclassifyInPlace(NSMutableArray<YCYRecordedWrite *> *items);
 static void YCYDumpClassDetailed(Class cls);
+static void YCYRememberPeripheral(CBPeripheral *peripheral);
+static void YCYShowToast(NSString *text);
+static CBCharacteristic *YCYFindCharacteristic(CBPeripheral *peripheral, NSString *serviceUUID, NSString *charUUID);
+static NSArray<CBCharacteristic *> *YCYWriteCharacteristics(CBPeripheral *peripheral);
+static void YCYEnableNotifies(CBPeripheral *peripheral);
+static NSArray<CBPeripheral *> *YCYConnectedPeripherals(void);
+static void YCYOnNotificationReceived(CBPeripheral *peripheral,
+                                       CBCharacteristic *characteristic,
+                                       NSData *value);
+
+#pragma mark - 工具
 
 static void YCYInitState(void) {
     static dispatch_once_t onceToken;
@@ -372,7 +386,6 @@ static void YCYProbeDCBLEInstances(void) {
         return;
     }
 
-    // 1. 尝试所有可能的共享实例方法
     NSArray *sharedSelectors = @[
         @"shared", @"sharedInstance", @"sharedManager",
         @"defaultManager", @"singleton", @"instance",
@@ -393,7 +406,6 @@ static void YCYProbeDCBLEInstances(void) {
         }
     }
 
-    // 2. 从 appCentral 的 delegate 链中寻找
     if (appCentral && appCentral.delegate) {
         id del = appCentral.delegate;
         YCYLog(@"[probe] appCentral delegate = %@", NSStringFromClass([del class]));
@@ -401,7 +413,6 @@ static void YCYProbeDCBLEInstances(void) {
         if (gDCBLE) return;
     }
 
-    // 3. 从 lastAppPeripheral 的 delegate 中寻找
     if (lastAppPeripheral && lastAppPeripheral.delegate) {
         id del = lastAppPeripheral.delegate;
         YCYLog(@"[probe] lastAppPeripheral delegate = %@", NSStringFromClass([del class]));
@@ -409,7 +420,6 @@ static void YCYProbeDCBLEInstances(void) {
         if (gDCBLE) return;
     }
 
-    // 4. 全局搜索已注册的 BLE 管理器实例（兜底）
     if (!gDCBLE) {
         YCYLog(@"[probe] 未获取到 DCBLEManager 实例（后续 setDelegate hook 仍有机会捕获）");
     } else {
@@ -433,7 +443,6 @@ static BOOL YCYTryNativeOpenFuzzy(void) {
         NSString *name = NSStringFromSelector(sel);
         NSUInteger nargs = method_getNumberOfArguments(ms[i]) - 2;
         if (nargs > 2) continue;
-        // 排除明显的非动作方法
         if ([name hasPrefix:@"set"] || [name hasPrefix:@"get"] ||
             [name hasPrefix:@"is"]  || [name hasPrefix:@"init"] ||
             [name hasPrefix:@"_"] || [name hasPrefix:@"."]) {
@@ -528,7 +537,6 @@ static BOOL YCYTryNativeOpen(void) {
         }
     }
 
-    // 硬编码没命中 → 模糊匹配兜底
     YCYLog(@"硬编码列表未命中，尝试模糊匹配 DCBLEManager 开锁方法");
     if (YCYTryNativeOpenFuzzy()) return YES;
 
@@ -1577,7 +1585,6 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
         return;
     }
 
-    // 每次尝试开锁都刷新一次 DCBLE 实例探测（App 可能刚刚重建过管理器）
     if (!gDCBLE) YCYProbeDCBLEInstances();
 
     NSArray *connected = YCYConnectedPeripherals();
@@ -1629,7 +1636,6 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
         YCYLog(@"会话不可用（connected=%d keyReady=%d），触发 App 重连", appConnected, gSessionKeyReady);
         BOOL triggered = YCYTriggerAppRescan();
         if (!triggered) {
-            // DCBLEManager 重扫不可用，回退 appCentral 扫描
             triggered = YCYConnectViaAppCentral();
         }
         if (triggered) {
@@ -1959,7 +1965,6 @@ static void YCYShowMenu(UIButton *sender) {
         /* 连接建立 ≠ 密钥就绪。仅设置握手窗口；sessionGen 由 NOTIFY 挑战递增。 */
         gHandshakeWritesLeft = 3;
         gHandshakeUntil = [NSDate dateWithTimeIntervalSinceNow:6.0];
-        /* 连接变了，旧会话密钥作废，等待下一次握手通知 */
         gSessionKeyReady = NO;
     }
 }
@@ -2082,7 +2087,6 @@ static void YCYScheduleFloatingButton(void) {
     gNeedsRediscover = YES;
     gHandshakeWritesLeft = 3;
     gHandshakeUntil = [NSDate dateWithTimeIntervalSinceNow:6.0];
-    /* 连接刚发出，密钥尚未协商 */
     gSessionKeyReady = NO;
     if (![self.delegate isKindOfClass:[YCYBleEngine class]]) {
         appCentral = self;
@@ -2197,16 +2201,7 @@ static void YCYScheduleFloatingButton(void) {
 
 %end
 
-#pragma mark - CBPeripheralDelegate 通知（App 路径）
-
-/*
- * App 自己的 CBPeripheralDelegate 收到通知时，我们需要把握手挑战回传进 YCYOnNotificationReceived，
- * 否则 gSessionGen / gSessionKeyReady 只会被 YCYBleEngine 的 delegate 更新。
- *
- * 由于 delegate 是外部对象，这里 hook 通用的 setNotifyValue / didUpdateValueForCharacteristic
- * 无法直接拦到 App 的 delegate 回调，因此我们退一步：
- * 在 CBCharacteristic 的 -setValue: 上做一次兜底（App 收到通知后 CoreBluetooth 会 setValue）。
- */
+#pragma mark - CBCharacteristic 通知（App 路径兜底）
 
 %hook CBCharacteristic
 
