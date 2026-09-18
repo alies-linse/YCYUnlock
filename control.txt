@@ -1,0 +1,9 @@
+Package: com.ycy.unlock
+Name: YCYUnlock
+Version: 1.4.0
+Architecture: iphoneos-arm
+Description: YS04 overlay unlock helper for 役次元
+Maintainer: YCY
+Author: YCY
+Section: Tweaks
+Depends: firmware (>= 13.0)
