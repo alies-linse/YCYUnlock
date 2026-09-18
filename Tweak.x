@@ -5,30 +5,22 @@
 #import <objc/runtime.h>
 
 /*
- * YCYUnlock v1.4.1
+ * YCYUnlock v1.5.0
  *
  * 已证实：
- * - 全部 WRITE 都是 16 字节会话密文，明文特征码无效
- * - 整段突发重放 = 先开再关（心跳/关锁被一起发）
- * - v1.2 把连上后的鉴权包冻成「开锁」（9/15 日志：跳过 13 35… 后冻住 4B 58… / 9B 17…）
- * - 断电后旧密文必然失败：挑战变了，硬重放无 NOTIFY
- * - JS _ble_do 不在全局；原生 BLE 类是 DCBLEManager
- *
- * v1.4.1（本日志）：
- * - 重连 KVO state=2 已连上，但 Connecting 时把 lastAppPeripheral 清掉，轮询一直 connected=0
- * - 握手 left=5 用的是 AND，App 不写就永远 handshakeDone=0，原生开锁根本没被调用
- * - 原生开锁是让 App 自己组当前会话密文，不应等握手包
- * 1. lastAppPeripheral 只在断开时清空，Connected 时立刻写回
- * 2. 轮询用外设池，不单看 lastAppPeripheral
- * 3. 连上 + 发现特征后立刻调 DCBLEManager，不等握手包
- * 4. hook DCBLEManager 的 NOTIFY，强制 dump 方法列表
- * 5. 未连接时先试 DCBLEManager 自己的 connect
+ * - DCBLEManager 是 DCloud 蓝牙壳，没有 open/unlock。真正连接是 6 参
+ *   connectPeripheral:connectOptions:stopScanAfterConnected:servicesOptions:characteristicsOptions:completeBlock:
+ * - v1.4.1 把 scanForPeripherals 当成连接成功，锁盒蓝灯都不会亮
+ * - 官方库 https://github.com/YCY-YOKONEX/YCY-YOKONEX-OpenSource 智能锁协议「正在内测」，没有 YS04 文档
+ * - 开锁密文仍在 JS 层；连接成功后才能走握手
  */
 
 #pragma mark - 常量（YS04 / Walkiz）
 
 static NSString * const kYCYChar9001 = @"00009001-0000-1000-8000-57616C6B697A";
+static NSString * const kYCYChar9002 = @"00009002-0000-1000-8000-57616C6B697A";
 static NSString * const kYCYCharAE01 = @"AE01";
+static NSString * const kYCYCharAE02 = @"AE02";
 static NSString * const kYCYSvc9000  = @"00009000-0000-1000-8000-57616C6B697A";
 static NSString * const kYCYSvcAE00  = @"AE00";
 static NSString * const kYCYRecordsKey = @"YCYUnlock.canonicalWrites.v4";
@@ -36,7 +28,7 @@ static NSString * const kYCYRecordsKeyV3 = @"YCYUnlock.canonicalWrites.v3";
 static NSString * const kYCYRecordsKeyV2 = @"YCYUnlock.canonicalWrites.v2";
 static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
-static NSString * const kYCYVersion = @"1.4.1";
+static NSString * const kYCYVersion = @"1.5.0";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -296,13 +288,14 @@ static BOOL YCYNameLooksLikeOpen(NSString *name) {
 }
 
 static BOOL YCYNameLooksLikeConnect(NSString *name) {
-    if (YCYNameLooksDangerous(name)) return NO;
     NSString *n = name.lowercaseString;
-    if ([n containsString:@"disconnect"] || [n containsString:@"cancelconnect"]) return NO;
-    if ([n containsString:@"connect"] || [n containsString:@"reconnect"] ||
-        [n isEqualToString:@"scan"] || [n hasPrefix:@"scan"]) {
-        return YES;
+    if ([n containsString:@"disconnect"] || [n containsString:@"cancel"] ||
+        [n containsString:@"fail"] || [n containsString:@"scan"] ||
+        [n hasPrefix:@"centralmanager"]) {
+        return NO;
     }
+    if ([n containsString:@"connectperipheral"]) return YES;
+    if ([n isEqualToString:@"connect"] || [n isEqualToString:@"connect:"]) return YES;
     return NO;
 }
 
@@ -584,10 +577,29 @@ static void YCYDumpDCBLENow(NSString *reason) {
     Class cls = mgr ? [mgr class] : NSClassFromString(@"DCBLEManager");
     if (cls) {
         YCYDumpClassDetailed(cls);
-        YCYDumpClassDetailed(object_getClass((id)cls));
         if (mgr) YCYHookDCBLENotify([mgr class]);
     } else {
         YCYLog(@"进程里没有 DCBLEManager 类");
+    }
+    if (mgr && [mgr respondsToSelector:@selector(dcDelegate)]) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        id del = [mgr performSelector:@selector(dcDelegate)];
+        #pragma clang diagnostic pop
+        YCYLog(@"dcDelegate class=%@", del ? NSStringFromClass([del class]) : @"nil");
+        if (del) YCYDumpClassDetailed([del class]);
+    }
+    if (mgr) {
+        Ivar iv = class_getInstanceVariable([mgr class], "_centralManager");
+        if (iv) {
+            id cm = object_getIvar(mgr, iv);
+            YCYLog(@"ivar _centralManager=%@ state=%ld",
+                   cm ? NSStringFromClass([cm class]) : @"nil",
+                   [cm isKindOfClass:[CBCentralManager class]] ? (long)[(CBCentralManager *)cm state] : -1);
+            if ([cm isKindOfClass:[CBCentralManager class]] && !appCentral) {
+                appCentral = (CBCentralManager *)cm;
+            }
+        }
     }
     YCYLog(@"候选开锁 %lu: %@", (unsigned long)gDCBLEOpenSels.count,
            gDCBLEOpenSels.count ? [gDCBLEOpenSels componentsJoinedByString:@", "] : @"(空)");
@@ -595,42 +607,146 @@ static void YCYDumpDCBLENow(NSString *reason) {
            gDCBLEConnectSels.count ? [gDCBLEConnectSels componentsJoinedByString:@", "] : @"(空)");
 }
 
-static BOOL YCYTryNativeConnect(void) {
+static CBCentralManager *YCYAnyCentral(void) {
+    if (appCentral) return appCentral;
     id mgr = YCYFindDCBLE();
-    if (!mgr) {
-        YCYLog(@"没有 DCBLEManager，无法原生连接");
+    if (!mgr) return nil;
+    Ivar iv = class_getInstanceVariable([mgr class], "_centralManager");
+    if (!iv) return nil;
+    id cm = object_getIvar(mgr, iv);
+    if ([cm isKindOfClass:[CBCentralManager class]]) {
+        appCentral = (CBCentralManager *)cm;
+        return appCentral;
+    }
+    return nil;
+}
+
+static CBPeripheral *YCYRetrieveLockPeripheral(void) {
+    CBPeripheral *p = lastAppPeripheral;
+    if (p && p.state == CBPeripheralStateConnected) return p;
+
+    CBCentralManager *c = YCYAnyCentral();
+    if (!c) {
+        YCYLog(@"retrieve 失败：没有 CBCentralManager");
+        return p;
+    }
+    NSMutableArray *ids = [NSMutableArray array];
+    if (lastLockUUID) [ids addObject:lastLockUUID];
+    if (ids.count) {
+        NSArray *known = [c retrievePeripheralsWithIdentifiers:ids];
+        YCYLog(@"retrievePeripherals count=%lu uuid=%@",
+               (unsigned long)known.count, lastLockUUID.UUIDString);
+        if (known.firstObject) {
+            p = known.firstObject;
+            YCYRememberPeripheral(p);
+            lastAppPeripheral = p;
+            return p;
+        }
+    }
+    NSArray *svcs = @[
+        [CBUUID UUIDWithString:kYCYSvc9000],
+        [CBUUID UUIDWithString:kYCYSvcAE00]
+    ];
+    NSArray *already = [c retrieveConnectedPeripheralsWithServices:svcs];
+    YCYLog(@"retrieveConnected count=%lu", (unsigned long)already.count);
+    for (CBPeripheral *x in already) {
+        if (YCYLooksLikeLockName(x.name) || (lastLockUUID && [x.identifier isEqual:lastLockUUID])) {
+            YCYRememberPeripheral(x);
+            lastAppPeripheral = x;
+            return x;
+        }
+    }
+    return already.firstObject;
+}
+
+static BOOL YCYInvokeDCBLEConnect6(CBPeripheral *p) {
+    id mgr = YCYFindDCBLE();
+    if (!mgr || !p) return NO;
+    SEL sel = NSSelectorFromString(@"connectPeripheral:connectOptions:stopScanAfterConnected:servicesOptions:characteristicsOptions:completeBlock:");
+    if (![mgr respondsToSelector:sel]) {
+        YCYLog(@"DCBLE 没有 6 参 connectPeripheral");
         return NO;
     }
-    NSMutableArray *sels = [NSMutableArray array];
-    [sels addObjectsFromArray:gDCBLEConnectSels];
-    for (NSString *s in @[@"connect", @"bleConnect", @"startConnect", @"connectLock",
-                          @"connectDevice", @"reconnect", @"scanAndConnect", @"startScan"]) {
-        if (![sels containsObject:s]) [sels addObject:s];
+    NSMethodSignature *sig = [mgr methodSignatureForSelector:sel];
+    if (!sig || sig.numberOfArguments < 8) {
+        YCYLog(@"6 参 connect signature 不对 nargs=%lu", (unsigned long)sig.numberOfArguments);
+        return NO;
     }
-    for (NSString *s in sels) {
-        if (![s hasSuffix:@":"] && YCYInvoke(mgr, s, nil)) return YES;
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    inv.selector = sel;
+    inv.target = mgr;
+
+    CBPeripheral *peri = p;
+    [inv setArgument:&peri atIndex:2];
+
+    NSDictionary *opts = @{};
+    [inv setArgument:&opts atIndex:3];
+
+    const char *tStop = [sig getArgumentTypeAtIndex:4];
+    if (tStop && (tStop[0] == 'B' || tStop[0] == 'c' || tStop[0] == 'C')) {
+        unsigned char stop = 1;
+        [inv setArgument:&stop atIndex:4];
+    } else {
+        BOOL stop = YES;
+        [inv setArgument:&stop atIndex:4];
     }
-    NSArray *oneArg = @[
-        @"connect:", @"connectPeripheral:", @"connectDevice:", @"connectLock:",
-        @"connectUUID:", @"connectWithUUID:", @"connectWithMac:", @"connectMac:"
+
+    NSArray *svcs = @[
+        [CBUUID UUIDWithString:kYCYSvc9000],
+        [CBUUID UUIDWithString:kYCYSvcAE00]
     ];
-    for (NSString *s in gDCBLEConnectSels) {
-        if ([s hasSuffix:@":"] && ![oneArg containsObject:s]) {
-            oneArg = [oneArg arrayByAddingObject:s];
-        }
-    }
-    NSArray *args = @[
-        lastAppPeripheral ?: [NSNull null],
-        lastLockUUID.UUIDString ?: @"",
-        lastLockName ?: @""
+    [inv setArgument:&svcs atIndex:5];
+
+    NSArray *chars = @[
+        [CBUUID UUIDWithString:kYCYChar9001],
+        [CBUUID UUIDWithString:kYCYChar9002],
+        [CBUUID UUIDWithString:kYCYCharAE01],
+        [CBUUID UUIDWithString:kYCYCharAE02]
     ];
-    for (NSString *s in oneArg) {
-        for (id a in args) {
-            id arg = (a == [NSNull null]) ? nil : a;
-            if (YCYInvoke(mgr, s, arg)) return YES;
+    [inv setArgument:&chars atIndex:6];
+
+    void (^cb)(CBPeripheral *, NSError *) = ^(CBPeripheral *peri2, NSError *err) {
+        YCYLog(@"DCBLE 6参 complete peri=%@ err=%@",
+               YCYPeripheralName(peri2), err);
+        if (peri2) {
+            lastAppPeripheral = peri2;
+            YCYRememberPeripheral(peri2);
         }
+    };
+    [inv setArgument:&cb atIndex:7];
+    [inv retainArguments];
+
+    YCYLog(@"invoke 6参 connectPeripheral name=%@ uuid=%@",
+           YCYPeripheralName(p), p.identifier.UUIDString);
+    @try {
+        [inv invoke];
+        return YES;
+    } @catch (NSException *ex) {
+        YCYLog(@"6参 connect 异常: %@", ex.reason);
+        return NO;
     }
-    YCYLog(@"DCBLEManager 没有匹配到连接方法");
+}
+
+static BOOL YCYTryNativeConnect(void) {
+    CBPeripheral *p = YCYRetrieveLockPeripheral();
+    BOOL started = NO;
+    if (p) {
+        lastAppPeripheral = p;
+        YCYRememberPeripheral(p);
+        if (p.state == CBPeripheralStateConnected) {
+            YCYLog(@"外设已经是 Connected %@", YCYPeripheralName(p));
+            return YES;
+        }
+        if (YCYInvokeDCBLEConnect6(p)) started = YES;
+        CBCentralManager *c = YCYAnyCentral();
+        if (c && c.state == CBManagerStatePoweredOn) {
+            YCYLog(@"appCentral connectPeripheral %@", YCYPeripheralName(p));
+            [c connectPeripheral:p options:nil];
+            started = YES;
+        }
+        return started;
+    }
+    YCYLog(@"没有已记住的 YS04，改为扫描（不会把 scan 当成已连接）");
     return NO;
 }
 
@@ -1486,6 +1602,54 @@ static BOOL YCYTryJSOpen(void) {
     return opened;
 }
 
+static BOOL YCYEvalJSAll(NSString *script, NSString *tag, NSString *successPrefix) {
+    NSArray *ctxs;
+    @synchronized (jsContexts) {
+        ctxs = [[jsContexts allObjects] copy];
+    }
+    if (ctxs.count == 0) {
+        YCYLog(@"无 JSContext，跳过 %@", tag);
+        return NO;
+    }
+    gInJSProbe = YES;
+    BOOL ok = NO;
+    for (JSContext *ctx in ctxs) {
+        @try {
+            JSValue *v = [ctx evaluateScript:script];
+            NSString *s = v.isString ? v.toString : @"nil";
+            YCYLog(@"%@ result=%@", tag, s);
+            if (successPrefix.length && [s hasPrefix:successPrefix]) ok = YES;
+            if ([s hasPrefix:@"uni."] || [s hasPrefix:@"plus."]) ok = YES;
+        } @catch (NSException *ex) {
+            YCYLog(@"%@ 异常: %@", tag, ex.reason);
+        }
+    }
+    gInJSProbe = NO;
+    return ok;
+}
+
+static BOOL YCYTryJSConnect(void) {
+    NSString *uuid = lastLockUUID.UUIDString ?: @"";
+    if (uuid.length == 0) {
+        YCYLog(@"JS connect 没有 lastLockUUID");
+        return NO;
+    }
+    NSString *script = [NSString stringWithFormat:
+        @"(function(){try{"
+        "var id='%@';"
+        "if(typeof uni!=='undefined'&&typeof uni.createBLEConnection==='function'){"
+        "uni.createBLEConnection({deviceId:id,timeout:15000});"
+        "return 'uni.createBLEConnection';}"
+        "if(typeof plus!=='undefined'&&plus.bluetooth&&typeof plus.bluetooth.createBLEConnection==='function'){"
+        "plus.bluetooth.createBLEConnection({deviceId:id});"
+        "return 'plus.bluetooth.createBLEConnection';}"
+        "var u=(typeof uni!=='undefined')?Object.keys(uni).filter(function(k){return /ble|lock|open/i.test(k);}).slice(0,20).join(','):'no-uni';"
+        "var p=(typeof plus!=='undefined'&&plus.bluetooth)?Object.keys(plus.bluetooth).slice(0,20).join(','):'no-plus.bt';"
+        "return 'miss uniKeys='+u+' plusBt='+p;"
+        "}catch(e){return 'err:'+String(e);}})()", uuid];
+    return YCYEvalJSAll(script, @"JS connect", @"uni.create");
+}
+
 #pragma mark - 自建 BLE 连接（仅发现/保活，禁止写旧密文）
 
 @interface YCYBleEngine : NSObject <CBCentralManagerDelegate, CBPeripheralDelegate>
@@ -1649,12 +1813,9 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
            gDCBLE ? NSStringFromClass([gDCBLE class]) : @"nil");
 
     if (isReady && (charsReady || timeOk)) {
-        if (attempts == 2) YCYDumpDCBLENow(@"reconnect-ready");
-        if (YCYTryNativeOpen()) {
-            YCYShowToast(@"已连上，已调用 DCBLEManager 开锁");
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ YCYFinishUnlockFlight(); });
-            return;
+        if (attempts == 2) {
+            YCYDumpDCBLENow(@"reconnect-ready");
+            YCYTryJSConnect();
         }
         if (tryJS && YCYTryJSOpen()) {
             YCYShowToast(@"已连上，已调用 JS 开锁");
@@ -1662,6 +1823,9 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
                            dispatch_get_main_queue(), ^{ YCYFinishUnlockFlight(); });
             return;
         }
+        // DCBLEManager 没有 open，不再假装 invoke 成功
+    } else if (attempts == 1) {
+        YCYTryJSConnect();
     }
 
     if (attempts < 10) {
@@ -1724,20 +1888,21 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
     }
 
     if (!appConnected) {
-        YCYLog(@"未连接：先试 DCBLEManager.connect，再退回 appCentral");
+        YCYLog(@"未连接：6参 DCBLE connect + appCentral.connect + JS createBLEConnection");
         YCYDumpDCBLENow(@"before-reconnect");
         BOOL started = YCYTryNativeConnect();
         if (!started) started = YCYConnectViaAppCentral();
-        if (started) {
-            YCYShowToast(@"锁盒已断电或断连\n正在重连，连上后走原生开锁");
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+        BOOL js = YCYTryJSConnect();
+        if (started || js) {
+            YCYShowToast(@"正在连接 YS04…\n应出现蓝灯后再握手");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 YCYPollUnlockAfterReconnect(1, tryJS);
             });
             return;
         }
         YCYFinishUnlockFlight();
-        YCYShowToast(@"无法让 App 重连\n请先打开 App 蓝牙页再试");
+        YCYShowToast(@"无法重连\n请先打开 App 蓝牙页再试");
         return;
     }
 
@@ -2378,7 +2543,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.4.1 重连后立刻调原生，不再等握手包；禁止盲放旧密文");
+    YCYLog(@"v1.5.0 用 DCBLE 6参 connectPeripheral，禁止把 scan 当成已连接");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
