@@ -32,7 +32,7 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.6.0";
+static NSString * const kYCYVersion = @"1.6.1";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -2247,6 +2247,7 @@ static void YCYShowMenu(UIButton *sender) {
                                              style:UIAlertActionStyleDefault
                                            handler:^(UIAlertAction *a) {
                                                (void)a;
+                                               YCYDumpDCBLENow(@"menu-native-open");
                                                if (YCYTryNativeOpen()) {
                                                    YCYShowToast(@"已调用 DCBLEManager");
                                                } else {
@@ -2674,6 +2675,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         YCYDumpInterestingClasses();
+        YCYDumpDCBLENow(@"launch");
     });
     BOOL result = %orig(application, launchOptions);
     YCYScheduleFloatingButton();
@@ -2702,7 +2704,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.6.0 连上先握手/_init_ble，等新 NOTIFY 再 _ble_do");
+    YCYLog(@"v1.6.1 连上先握手/_init_ble，等新 NOTIFY 再 _ble_do");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
