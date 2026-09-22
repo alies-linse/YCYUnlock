@@ -62,6 +62,7 @@ static BOOL gSawDiscoverChars = NO;
 static BOOL gDidDiscoverServices = NO;
 static NSUInteger gDiscoveredCharacteristicCount = 0;
 static BOOL gDCBLENotifyHooked = NO;
+static BOOL gDCBLEDiscoverHooked = NO;
 static BOOL gSessionNotifySeen = NO;
 static BOOL gSessionHandshakeWrite = NO;
 static BOOL gDidPostConnect = NO;
@@ -124,6 +125,8 @@ static void YCYRememberPeripheral(CBPeripheral *peripheral);
 static void YCYInstallJSTrap(JSContext *ctx);
 static void YCYNoteNewSession(NSString *reason);
 static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS);
+static void YCYEnableNotifies(CBPeripheral *peripheral);
+static BOOL YCYHasRequiredBLELayout(CBPeripheral *peripheral);
 
 static void YCYInitState(void) {
     static dispatch_once_t onceToken;
@@ -441,6 +444,72 @@ static void YCYHookDCBLENotify(Class cls) {
     YCYLog(@"已 hook %@ NOTIFY", NSStringFromClass(cls));
 }
 
+static void (*YCYOrigDiscoverServices)(id, SEL, CBPeripheral *, NSError *) = NULL;
+static void (*YCYOrigDiscoverChars)(id, SEL, CBPeripheral *, CBService *, NSError *) = NULL;
+
+static void YCYHookedDiscoverServices(id self, SEL _cmd, CBPeripheral *p, NSError *e) {
+    if (e) {
+        YCYLog(@"发现服务失败 %@", e);
+    } else {
+        gDidDiscoverServices = (p.services.count > 0);
+        YCYLog(@"发现服务完成 name=%@ count=%lu",
+               YCYPeripheralName(p), (unsigned long)p.services.count);
+    }
+    if (YCYOrigDiscoverServices) {
+        YCYOrigDiscoverServices(self, _cmd, p, e);
+    }
+}
+
+static void YCYHookedDiscoverChars(id self, SEL _cmd, CBPeripheral *p, CBService *service, NSError *e) {
+    if (e) {
+        YCYLog(@"发现特征失败 service=%@ error=%@", service.UUID.UUIDString, e);
+    } else {
+        gDiscoveredCharacteristicCount += service.characteristics.count;
+        gSawDiscoverChars = YES;
+        YCYLog(@"发现特征完成 service=%@ count=%lu layout=%d",
+               service.UUID.UUIDString,
+               (unsigned long)service.characteristics.count,
+               YCYHasRequiredBLELayout(p));
+        if (YCYHasRequiredBLELayout(p)) {
+            YCYEnableNotifies(p);
+        }
+    }
+    if (YCYOrigDiscoverChars) {
+        YCYOrigDiscoverChars(self, _cmd, p, service, e);
+    }
+}
+
+static void YCYHookDCBLEDiscover(Class cls) {
+    if (gDCBLEDiscoverHooked || !cls) return;
+    BOOL hookedAny = NO;
+
+    SEL svcSel = @selector(peripheral:didDiscoverServices:);
+    Method svcM = class_getInstanceMethod(cls, svcSel);
+    if (svcM) {
+        YCYOrigDiscoverServices = (void (*)(id, SEL, CBPeripheral *, NSError *))method_getImplementation(svcM);
+        const char *types = method_getTypeEncoding(svcM);
+        if (!class_addMethod(cls, svcSel, (IMP)YCYHookedDiscoverServices, types)) {
+            method_setImplementation(svcM, (IMP)YCYHookedDiscoverServices);
+        }
+        hookedAny = YES;
+        YCYLog(@"已 hook %@ didDiscoverServices", NSStringFromClass(cls));
+    }
+
+    SEL charSel = @selector(peripheral:didDiscoverCharacteristicsForService:error:);
+    Method charM = class_getInstanceMethod(cls, charSel);
+    if (charM) {
+        YCYOrigDiscoverChars = (void (*)(id, SEL, CBPeripheral *, CBService *, NSError *))method_getImplementation(charM);
+        const char *types = method_getTypeEncoding(charM);
+        if (!class_addMethod(cls, charSel, (IMP)YCYHookedDiscoverChars, types)) {
+            method_setImplementation(charM, (IMP)YCYHookedDiscoverChars);
+        }
+        hookedAny = YES;
+        YCYLog(@"已 hook %@ didDiscoverCharacteristics", NSStringFromClass(cls));
+    }
+
+    if (hookedAny) gDCBLEDiscoverHooked = YES;
+}
+
 static void YCYRememberDCBLE(id obj) {
     if (!obj) return;
     NSString *cls = NSStringFromClass([obj class]);
@@ -451,6 +520,7 @@ static void YCYRememberDCBLE(id obj) {
     }
     gDCBLE = obj;
     YCYHookDCBLENotify([obj class]);
+    YCYHookDCBLEDiscover([obj class]);
     if (!gDumpedDCBLE) {
         gDumpedDCBLE = YES;
         YCYLog(@"捕获 BLE 管理器 class=%@", cls);
@@ -1701,7 +1771,7 @@ static BOOL YCYTryJSConnect(void) {
     return YCYEvalJSAll(script, @"JS connect", @"uni.create");
 }
 
-static id YCYFindLibBT(void) {
+static __attribute__((unused)) id YCYFindLibBT(void) {
     id mgr = YCYFindDCBLE();
     if (mgr && [mgr respondsToSelector:@selector(dcDelegate)]) {
         #pragma clang diagnostic push
@@ -1713,7 +1783,7 @@ static id YCYFindLibBT(void) {
     return nil;
 }
 
-static id YCYMakePGCommand(NSDictionary *opts) {
+static __attribute__((unused)) id YCYMakePGCommand(NSDictionary *opts) {
     Class C = NSClassFromString(@"PGMethod");
     if (!C) return @[opts ?: @{}];
     id cmd = [[C alloc] init];
@@ -1723,7 +1793,7 @@ static id YCYMakePGCommand(NSDictionary *opts) {
     return cmd;
 }
 
-static BOOL YCYInvokeLibBT(NSString *selName, NSDictionary *opts) {
+static __attribute__((unused)) BOOL YCYInvokeLibBT(NSString *selName, NSDictionary *opts) {
     id plugin = YCYFindLibBT();
     if (!plugin) {
         YCYLog(@"没有 libBlueTooth，跳过 %@", selName);
@@ -1797,16 +1867,17 @@ static BOOL YCYReplayHello(CBPeripheral *p) {
 
 static void YCYStartPostConnectHandshake(CBPeripheral *p) {
     if (gDidPostConnect) return;
-    gDidPostConnect = YES;
-    YCYLog(@"连上后开始握手 notify=%d hello=%lu",
-           gSessionNotifySeen, (unsigned long)gHelloPayload.length);
-    if (p) YCYEnableNotifies(p);
-    // 不再反射调用 libBlueTooth。日志中的 index 1 beyond bounds 说明
-    // PGPlugin 仍处于 JS 设备数组未建立的阶段；CoreBluetooth 已经足够完成发现/订阅。
     if (!YCYHasRequiredBLELayout(p)) {
         YCYLog(@"握手延后：服务/特征尚未完整 layout=%@", p.services);
         return;
     }
+    gDidPostConnect = YES;
+    YCYLog(@"连上后开始握手 notify=%d hello=%lu chars=%lu",
+           gSessionNotifySeen, (unsigned long)gHelloPayload.length,
+           (unsigned long)gDiscoveredCharacteristicCount);
+    // 不再反射调用 libBlueTooth。日志中的 index 1 beyond bounds 说明
+    // PGPlugin 仍处于 JS 设备数组未建立的阶段；CoreBluetooth 已经足够完成发现/订阅。
+    YCYEnableNotifies(p);
     YCYTryJSHandshake();
     if (p && p.services.count > 0) YCYReplayHello(p);
 }
@@ -1966,12 +2037,15 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
     BOOL charsReady = YCYHasRequiredBLELayout(ready);
     BOOL handshakeOk = gSessionNotifySeen || gSessionHandshakeWrite;
 
-    YCYLog(@"重连轮询 #%d ready=%@ state=%ld chars=%d svcs=%lu notify=%d hsWrite=%d hello=%lu lastApp=%@",
+    YCYLog(@"重连轮询 #%d ready=%@ state=%ld chars=%d svcs=%lu discovered=%lu sawChars=%d didSvcs=%d notify=%d hsWrite=%d hello=%lu lastApp=%@",
            attempts,
            YCYPeripheralName(ready),
            ready ? (long)ready.state : -1,
            charsReady,
            (unsigned long)svcCount,
+           (unsigned long)gDiscoveredCharacteristicCount,
+           gSawDiscoverChars,
+           gDidDiscoverServices,
            gSessionNotifySeen,
            gSessionHandshakeWrite,
            (unsigned long)gHelloPayload.length,
