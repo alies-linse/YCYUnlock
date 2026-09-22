@@ -59,6 +59,8 @@ static BOOL gDumpedDCBLE = NO;
 static BOOL gCaptureArmed = NO;
 static BOOL gHeartbeatSeen = NO;
 static BOOL gSawDiscoverChars = NO;
+static BOOL gDidDiscoverServices = NO;
+static NSUInteger gDiscoveredCharacteristicCount = 0;
 static BOOL gDCBLENotifyHooked = NO;
 static BOOL gSessionNotifySeen = NO;
 static BOOL gSessionHandshakeWrite = NO;
@@ -823,6 +825,8 @@ static void YCYNoteNewSession(NSString *reason) {
     gHandshakeUntil = [NSDate dateWithTimeIntervalSinceNow:kYCYHandshakeSeconds];
     gHeartbeatSeen = NO;
     gSawDiscoverChars = NO;
+    gDidDiscoverServices = NO;
+    gDiscoveredCharacteristicCount = 0;
     gSessionNotifySeen = NO;
     gSessionHandshakeWrite = NO;
     gDidPostConnect = NO;
@@ -922,6 +926,18 @@ static void YCYEnableNotifies(CBPeripheral *peripheral) {
             }
         }
     }
+}
+
+static BOOL YCYHasRequiredBLELayout(CBPeripheral *peripheral) {
+    if (!peripheral || peripheral.state != CBPeripheralStateConnected) return NO;
+    BOOL has9001 = NO, has9002 = NO;
+    for (CBService *service in peripheral.services) {
+        for (CBCharacteristic *c in service.characteristics) {
+            has9001 |= YCYUUIDMatch(c.UUID.UUIDString, kYCYChar9001);
+            has9002 |= YCYUUIDMatch(c.UUID.UUIDString, kYCYChar9002);
+        }
+    }
+    return has9001 && has9002;
 }
 
 #pragma mark - Toast / 弹窗
@@ -1785,20 +1801,11 @@ static void YCYStartPostConnectHandshake(CBPeripheral *p) {
     YCYLog(@"连上后开始握手 notify=%d hello=%lu",
            gSessionNotifySeen, (unsigned long)gHelloPayload.length);
     if (p) YCYEnableNotifies(p);
-    NSString *uuid = lastLockUUID.UUIDString ?: p.identifier.UUIDString ?: @"";
-    if (uuid.length) {
-        YCYInvokeLibBT(@"createBLEConnection:", @{@"deviceId": uuid, @"timeout": @15000});
-        YCYInvokeLibBT(@"notifyBLECharacteristicValueChange:", @{
-            @"deviceId": uuid,
-            @"serviceId": kYCYSvc9000,
-            @"characteristicId": kYCYChar9002,
-            @"state": @YES
-        });
-        YCYInvokeLibBT(@"getBLEDeviceServices:", @{@"deviceId": uuid});
-        YCYInvokeLibBT(@"getBLEDeviceCharacteristics:", @{
-            @"deviceId": uuid,
-            @"serviceId": kYCYSvc9000
-        });
+    // 不再反射调用 libBlueTooth。日志中的 index 1 beyond bounds 说明
+    // PGPlugin 仍处于 JS 设备数组未建立的阶段；CoreBluetooth 已经足够完成发现/订阅。
+    if (!YCYHasRequiredBLELayout(p)) {
+        YCYLog(@"握手延后：服务/特征尚未完整 layout=%@", p.services);
+        return;
     }
     YCYTryJSHandshake();
     if (p && p.services.count > 0) YCYReplayHello(p);
@@ -1887,6 +1894,7 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
 
 - (void)peripheral:(CBPeripheral *)peripheral didDiscoverServices:(NSError *)error {
     if (error) YCYLog(@"发现服务失败 %@", error);
+    gDidDiscoverServices = (error == nil && peripheral.services.count > 0);
     self.pendingDiscover = 0;
     if (peripheral.services.count == 0) {
         [self failWith:@"已连接但没有发现服务"];
@@ -1901,8 +1909,11 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
 - (void)peripheral:(CBPeripheral *)peripheral
 didDiscoverCharacteristicsForService:(CBService *)service
              error:(NSError *)error {
-    (void)service;
-    (void)error;
+    if (error) YCYLog(@"发现特征失败 service=%@ error=%@", service.UUID.UUIDString, error);
+    if (!error) {
+        gDiscoveredCharacteristicCount += service.characteristics.count;
+        gSawDiscoverChars = YES;
+    }
     self.pendingDiscover--;
     if (self.pendingDiscover <= 0 && !self.done) {
         if ([self hasWriteChars:peripheral]) {
@@ -1952,8 +1963,8 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
     CBPeripheral *ready = YCYReadyLock();
     BOOL isReady = (ready.state == CBPeripheralStateConnected);
     NSUInteger svcCount = ready.services.count;
-    BOOL charsReady = gSawDiscoverChars || svcCount > 0;
-    BOOL timeOk = (attempts >= 2);
+    BOOL charsReady = YCYHasRequiredBLELayout(ready);
+    BOOL timeOk = NO;
     BOOL handshakeOk = gSessionNotifySeen || gSessionHandshakeWrite;
 
     YCYLog(@"重连轮询 #%d ready=%@ state=%ld chars=%d svcs=%lu notify=%d hsWrite=%d hello=%lu lastApp=%@",
@@ -1967,8 +1978,9 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
            (unsigned long)gHelloPayload.length,
            YCYPeripheralName(lastAppPeripheral));
 
-    if (isReady && (charsReady || timeOk)) {
+    if (isReady && charsReady) {
         YCYStartPostConnectHandshake(ready);
+        YCYEnableNotifies(ready);
         if (handshakeOk && tryJS && !gDidJSOpenThisFlight) {
             gDidJSOpenThisFlight = YES;
             if (YCYTryJSOpen()) {
@@ -2567,14 +2579,15 @@ static void YCYScheduleFloatingButton(void) {
         YCYUUIDMatch(service.UUID.UUIDString, kYCYSvcAE00) ||
         [service.UUID.UUIDString.uppercaseString containsString:@"9000"] ||
         [service.UUID.UUIDString.uppercaseString containsString:@"AE00"]) {
-        gSawDiscoverChars = YES;
         lastAppPeripheral = self;
         YCYRememberPeripheral(self);
         __weak CBPeripheral *weakP = self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             CBPeripheral *p = weakP;
-            if (p.state == CBPeripheralStateConnected) YCYEnableNotifies(p);
+            if (p.state == CBPeripheralStateConnected && YCYHasRequiredBLELayout(p)) {
+                YCYEnableNotifies(p);
+            }
         });
     }
     %orig;
