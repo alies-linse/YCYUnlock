@@ -1964,7 +1964,6 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
     BOOL isReady = (ready.state == CBPeripheralStateConnected);
     NSUInteger svcCount = ready.services.count;
     BOOL charsReady = YCYHasRequiredBLELayout(ready);
-    BOOL timeOk = NO;
     BOOL handshakeOk = gSessionNotifySeen || gSessionHandshakeWrite;
 
     YCYLog(@"重连轮询 #%d ready=%@ state=%ld chars=%d svcs=%lu notify=%d hsWrite=%d hello=%lu lastApp=%@",
