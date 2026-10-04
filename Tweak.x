@@ -34,7 +34,7 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.7.2";
+static NSString * const kYCYVersion = @"1.7.3";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -1970,14 +1970,23 @@ static BOOL YCYTryJSHandshake(void) {
         "function call(fn,host,how){"
         "if(typeof fn!=='function')return '';"
         "var n=0;try{n=fn.length;}catch(e){}"
+        "try{"
         "if(n>=2){fn.call(host,'open',{play_id:0});}"
         "else{fn.call(host,'open');}"
         "return how+':arity='+n;"
+        "}catch(e){return how+':threw:'+String(e);}"
         "}"
-        "var hit=call(g.__ycy__init_ble,g,'trap');"
+        "var pages=[];"
+        "try{if(typeof getCurrentPages==='function')pages=getCurrentPages()||[];}catch(e){}"
+        "var hit='';"
+        "for(var i=pages.length-1;i>=0&&!hit;i--){"
+        "var vm=pages[i]&&(pages[i].$vm||pages[i]);"
+        "hit=call(vm&&vm._init_ble,vm,'page');"
+        "}"
+        "if(!hit)hit=call(g.__ycy__init_ble,g,'trap');"
         "if(!hit)hit=call(g._init_ble,g,'global');"
-        "if(hit)return 'handshake:'+hit;"
-        "return 'handshake:notify-only';"
+        "if(hit)return 'handshake:'+hit+':pages='+pages.length;"
+        "return 'handshake:notify-only:pages='+pages.length;"
         "}catch(e){return 'err:'+String(e);}})(this)", uuid];
     return YCYEvalJSAll(script, @"JS handshake", @"handshake:");
 }
@@ -2949,7 +2958,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.7.2 deviceDict 注入后按方法调用 _init_ble，等新 NOTIFY 再 _ble_do");
+    YCYLog(@"v1.7.3 在当前页面上调用 _init_ble，等新 NOTIFY 再 _ble_do");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
