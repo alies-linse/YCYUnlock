@@ -71,6 +71,7 @@ static BOOL gDidPostConnect = NO;
 static BOOL gDidJSOpenThisFlight = NO;
 static BOOL gJSAdapterOpened = NO;
 static BOOL gDidSeedDevice = NO;
+static BOOL gDidEnableNotifies = NO;
 static NSData *gHelloPayload;
 static NSString *gHelloCharUUID;
 static NSDate *gHandshakeUntil;
@@ -132,9 +133,8 @@ static void YCYNoteNewSession(NSString *reason);
 static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS);
 static void YCYEnableNotifies(CBPeripheral *peripheral);
 static BOOL YCYHasRequiredBLELayout(CBPeripheral *peripheral);
+static BOOL YCYIsFrozenPayload(NSData *data);
 static BOOL YCYEnsureColdStartStack(void);
-static void YCYLogColdState(NSString *tag);
-static void YCYWarmupBLE(NSString *reason);
 
 static void YCYInitState(void) {
     static dispatch_once_t onceToken;
@@ -594,13 +594,12 @@ static id YCYFindDCBLE(void) {
         if (p.delegate) mgr = p.delegate;
     }
     if (!mgr) {
-        for (NSString *cn in @[@"DCBLEManager", @"DCHLBLEManager", @"HLBLEManager"]) {
-            Class cls = NSClassFromString(cn);
-            if (!cls) continue;
+        Class cls = NSClassFromString(@"DCBLEManager");
+        if (cls) {
             YCYDumpClassDetailed(cls);
             for (NSString *s in @[@"shared", @"sharedInstance", @"sharedManager", @"defaultManager", @"singleton", @"manager"]) {
                 if ([cls respondsToSelector:NSSelectorFromString(s)]) {
-                    YCYLog(@"试 %@ +%@", cn, s);
+                    YCYLog(@"试 class 方法 +%@", s);
                     #pragma clang diagnostic push
                     #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
                     mgr = [cls performSelector:NSSelectorFromString(s)];
@@ -608,7 +607,6 @@ static id YCYFindDCBLE(void) {
                     if (mgr) break;
                 }
             }
-            if (mgr) break;
         }
     }
     if (mgr) YCYRememberDCBLE(mgr);
@@ -695,13 +693,6 @@ static void YCYDumpDCBLENow(NSString *reason) {
                 appCentral = (CBCentralManager *)cm;
             }
         }
-        @try {
-            id cm2 = [mgr valueForKey:@"centralManager"];
-            if ([cm2 isKindOfClass:[CBCentralManager class]] && !appCentral) {
-                appCentral = (CBCentralManager *)cm2;
-                YCYLog(@"KVC centralManager state=%ld", (long)appCentral.state);
-            }
-        } @catch (__unused NSException *e) {}
     }
     YCYLog(@"候选开锁 %lu: %@", (unsigned long)gDCBLEOpenSels.count,
            gDCBLEOpenSels.count ? [gDCBLEOpenSels componentsJoinedByString:@", "] : @"(空)");
@@ -917,6 +908,8 @@ static void YCYNoteNewSession(NSString *reason) {
     gSessionNotifySeen = NO;
     gSessionHandshakeWrite = NO;
     gDidPostConnect = NO;
+    gDidSeedDevice = NO;
+    gDidEnableNotifies = NO;
     [recordLock lock];
     [liveSession removeAllObjects];
     [payloadCounts removeAllObjects];
@@ -945,9 +938,6 @@ static void YCYRememberPeripheral(CBPeripheral *peripheral) {
     if (YCYLooksLikeLockName(peripheral.name) || lastLockUUID == nil) {
         lastLockUUID = peripheral.identifier;
         lastLockName = YCYPeripheralName(peripheral);
-        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        [ud setObject:lastLockUUID.UUIDString forKey:kYCYLockUUIDKey];
-        if (lastLockName.length) [ud setObject:lastLockName forKey:kYCYLockNameKey];
     }
     if (key.length && ![observedPeripheralIDs containsObject:key]) {
         [observedPeripheralIDs addObject:key];
@@ -1006,7 +996,9 @@ static NSArray<CBCharacteristic *> *YCYWriteCharacteristics(CBPeripheral *periph
 }
 
 static void YCYEnableNotifies(CBPeripheral *peripheral) {
+    if (gDidEnableNotifies) return;
     if (!peripheral.services) return;
+    gDidEnableNotifies = YES;
     for (CBService *service in peripheral.services) {
         for (CBCharacteristic *c in service.characteristics) {
             CBCharacteristicProperties p = c.properties;
@@ -1028,6 +1020,20 @@ static BOOL YCYHasRequiredBLELayout(CBPeripheral *peripheral) {
         }
     }
     return has9001 && has9002;
+}
+
+static BOOL YCYIsFrozenPayload(NSData *data) {
+    if (!data) return NO;
+    [recordLock lock];
+    BOOL matched = NO;
+    for (YCYRecordedWrite *item in canonicalWrites) {
+        if (item.value && [item.value isEqualToData:data]) {
+            matched = YES;
+            break;
+        }
+    }
+    [recordLock unlock];
+    return matched;
 }
 
 #pragma mark - Toast / 弹窗
@@ -1251,18 +1257,20 @@ static void YCYLoadRecords(void) {
     lastLockName = [ud stringForKey:kYCYLockNameKey];
     NSString *helloB64 = [ud stringForKey:kYCYHelloKey];
     if (helloB64.length) {
-        gHelloPayload = [[NSData alloc] initWithBase64EncodedString:helloB64 options:0];
-        gHelloCharUUID = [ud stringForKey:kYCYHelloCharKey];
-        NSLog(@"[YCYUnlock] 已加载握手首包 %lu 字节", (unsigned long)gHelloPayload.length);
+        NSData *loaded = [[NSData alloc] initWithBase64EncodedString:helloB64 options:0];
+        if (YCYIsFrozenPayload(loaded)) {
+            NSLog(@"[YCYUnlock] 丢弃已保存的冻结 hello HEX=%@",
+                  loaded ? @"frozen" : @"nil");
+            [ud removeObjectForKey:kYCYHelloKey];
+            [ud removeObjectForKey:kYCYHelloCharKey];
+            gHelloPayload = nil;
+            gHelloCharUUID = nil;
+        } else {
+            gHelloPayload = loaded;
+            gHelloCharUUID = [ud stringForKey:kYCYHelloCharKey];
+            NSLog(@"[YCYUnlock] 已加载握手首包 %lu 字节", (unsigned long)gHelloPayload.length);
+        }
     }
-    gSessionGen = 1;
-    gFrozenSessionGen = 0;
-    NSLog(@"[YCYUnlock] 冷启动恢复 uuid=%@ name=%@ frozen=%d records=%lu hello=%lu",
-          lastLockUUID.UUIDString ?: @"(无)",
-          lastLockName ?: @"(无)",
-          gCanonicalFrozen,
-          (unsigned long)canonicalWrites.count,
-          (unsigned long)gHelloPayload.length);
 }
 
 #pragma mark - 记录 / 重放
@@ -1374,21 +1382,6 @@ static void YCYRecordWrite(CBPeripheral *peripheral,
     }
     if (!isFrozenHex && data.length == 16) {
         gSessionHandshakeWrite = YES;
-        if (!gCaptureArmed && (!gHelloPayload || [gHelloPayload isEqualToData:data] == NO)) {
-            BOOL helloIsFrozen = NO;
-            if (gHelloPayload && gCanonicalFrozen) {
-                [recordLock lock];
-                NSData *fv = [canonicalWrites.firstObject.value copy];
-                [recordLock unlock];
-                helloIsFrozen = fv && [gHelloPayload isEqualToData:fv];
-            }
-            if (!gHelloPayload || helloIsFrozen) {
-                gHelloPayload = [data copy];
-                gHelloCharUUID = charUUID;
-                YCYLog(@"记住握手首包 char=%@ HEX=%@", charUUID, hex);
-                YCYPersistRecords();
-            }
-        }
     }
 
     [recordLock lock];
@@ -1416,6 +1409,16 @@ static void YCYRecordWrite(CBPeripheral *peripheral,
         }
     }
     if (handshakeSkip) {
+        if (!gHelloPayload &&
+            data.length == 16 &&
+            !YCYIsFrozenPayload(data)) {
+            gHelloPayload = [data copy];
+            gHelloCharUUID = charUUID;
+            YCYLog(@"记住握手首包 char=%@ HEX=%@", charUUID, hex);
+            YCYPersistRecords();
+        } else if (YCYIsFrozenPayload(data)) {
+            YCYLog(@"拒绝把冻结开锁包保存为 hello HEX=%@", hex);
+        }
         YCYLog(@"握手/建会话，跳过记录 left=%ld hb=%d HEX=%@",
                (long)gHandshakeWritesLeft, gHeartbeatSeen, hex);
         lastLockUUID = peripheral.identifier;
@@ -1656,7 +1659,7 @@ static NSString * const kYCYJSTrapScript =
     "Object.defineProperty(Object.prototype,name,{"
     "configurable:true,enumerable:false,"
     "set:function(v){"
-    "try{g[store]=v;g[store+'_this']=this;}catch(e){}"
+    "try{g[store]=v;}catch(e){}"
     "try{Object.defineProperty(this,name,{value:v,writable:true,configurable:true,enumerable:true});}"
     "catch(e){}"
     "}"
@@ -1669,14 +1672,8 @@ static NSString * const kYCYJSTrapScript =
 
 static NSString * const kYCYJSOpenScript =
     @"(function(g){try{"
-    "function call(store,raw){"
-    "var fn=g[store]||raw;"
-    "var th=g[store+'_this'];"
-    "if(typeof fn!=='function')return false;"
-    "if(th&&typeof th==='object'&&th!==g&&th!==Object.prototype){fn.call(th,'open');}"
-    "else fn('open');"
-    "return true;}"
-    "if(call('__ycy__ble_do',g._ble_do))return 'opened:trap_ble_do';"
+    "var fn=g.__ycy__ble_do||g._ble_do||g.__ycy_ble_do;"
+    "if(typeof fn==='function'){fn('open');return 'opened:trap_ble_do';}"
     "if(typeof _ble_do==='function'){_ble_do('open');return 'opened:_ble_do';}"
     "return 'miss';"
     "}catch(e){return 'err:'+String(e);}})(this)";
@@ -1802,10 +1799,10 @@ static BOOL YCYTryJSConnect(void) {
         @"(function(){try{"
         "var id='%@';"
         "if(typeof uni!=='undefined'&&typeof uni.createBLEConnection==='function'){"
-        "uni.createBLEConnection({deviceId:id,timeout:20000});"
+        "uni.createBLEConnection({deviceId:id,timeout:15000});"
         "return 'uni.createBLEConnection';}"
         "if(typeof plus!=='undefined'&&plus.bluetooth&&typeof plus.bluetooth.createBLEConnection==='function'){"
-        "plus.bluetooth.createBLEConnection({deviceId:id,timeout:20000});"
+        "plus.bluetooth.createBLEConnection({deviceId:id});"
         "return 'plus.bluetooth.createBLEConnection';}"
         "var u=(typeof uni!=='undefined')?Object.keys(uni).filter(function(k){return /ble|lock|open/i.test(k);}).slice(0,20).join(','):'no-uni';"
         "var p=(typeof plus!=='undefined'&&plus.bluetooth)?Object.keys(plus.bluetooth).slice(0,20).join(','):'no-plus.bt';"
@@ -1814,68 +1811,114 @@ static BOOL YCYTryJSConnect(void) {
     return YCYEvalJSAll(script, @"JS connect", @"uni.create");
 }
 
-static BOOL YCYTryJSOpenAdapter(void) {
-    NSString *script =
-        @"(function(){try{"
-        "if(typeof uni!=='undefined'&&typeof uni.openBluetoothAdapter==='function'){"
-        "uni.openBluetoothAdapter({});"
-        "return 'uni.openBluetoothAdapter';}"
-        "if(typeof plus!=='undefined'&&plus.bluetooth&&typeof plus.bluetooth.openBluetoothAdapter==='function'){"
-        "plus.bluetooth.openBluetoothAdapter({});"
-        "return 'plus.bluetooth.openBluetoothAdapter';}"
-        "return 'miss';"
-        "}catch(e){return 'err:'+String(e);}})()";
-    BOOL ok = YCYEvalJSAll(script, @"JS adapter", @"uni.open");
-    if (ok) gJSAdapterOpened = YES;
-    return ok;
-}
-
-static id YCYFindLibBT(void) {
-    if (gLibBT) return gLibBT;
+static __attribute__((unused)) id YCYFindLibBT(void) {
     id mgr = YCYFindDCBLE();
     if (mgr && [mgr respondsToSelector:@selector(dcDelegate)]) {
         #pragma clang diagnostic push
         #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
         id del = [mgr performSelector:@selector(dcDelegate)];
         #pragma clang diagnostic pop
-        if (del) {
-            gLibBT = del;
-            YCYLog(@"libBlueTooth via dcDelegate class=%@", NSStringFromClass([del class]));
-            return del;
-        }
+        if (del) return del;
     }
-    if (mgr) {
-        for (NSString *key in @[@"delegate", @"dcDelegate", @"plugin", @"_plugin"]) {
-            @try {
-                id del = [mgr valueForKey:key];
-                NSString *cn = del ? NSStringFromClass([del class]) : nil;
-                if (cn && ([cn localizedCaseInsensitiveContainsString:@"BlueTooth"] ||
-                           [cn localizedCaseInsensitiveContainsString:@"Bluetooth"])) {
-                    gLibBT = del;
-                    YCYLog(@"libBlueTooth via KVC %@ class=%@", key, cn);
-                    return del;
-                }
-            } @catch (__unused NSException *e) {}
-        }
-    }
-    return gLibBT;
+    return nil;
 }
 
-static id YCYMakePGCommand(NSString *function, NSDictionary *opts) {
+static __attribute__((unused)) id YCYMakePGCommand(NSDictionary *opts) {
     Class C = NSClassFromString(@"PGMethod");
-    NSString *cbid = [NSString stringWithFormat:@"YCYUnlock_%@", function ?: @"x"];
-    NSArray *args = @[cbid, opts ?: @{}, opts ?: @{}];
-    if (!C) return args;
+    if (!C) return @[opts ?: @{}];
     id cmd = [[C alloc] init];
-    @try { [cmd setValue:args forKey:@"arguments"]; } @catch (__unused NSException *e) {}
-    @try { [cmd setValue:cbid forKey:@"callBackID"]; } @catch (__unused NSException *e) {}
+    @try { [cmd setValue:@[opts ?: @{}] forKey:@"arguments"]; } @catch (__unused NSException *e) {}
+    @try { [cmd setValue:@"YCYUnlock" forKey:@"callBackID"]; } @catch (__unused NSException *e) {}
     @try { [cmd setValue:@"Bluetooth" forKey:@"featureName"]; } @catch (__unused NSException *e) {}
-    @try { [cmd setValue:function forKey:@"functionName"]; } @catch (__unused NSException *e) {}
-    @try { [cmd setValue:@"YCYUnlock" forKey:@"htmlID"]; } @catch (__unused NSException *e) {}
     return cmd;
 }
 
-static BOOL YCYInvokeLibBT(NSString *selName, NSDictionary *opts) {
+static void YCYLogLibBTDeviceKeys(id plugin) {
+    Class cls = [plugin class];
+    unsigned int n = 0;
+    objc_property_t *props = class_copyPropertyList(cls, &n);
+    NSMutableArray *hits = [NSMutableArray array];
+    for (unsigned int i = 0; i < n; i++) {
+        const char *nm = property_getName(props[i]);
+        if (!nm) continue;
+        NSString *name = [NSString stringWithUTF8String:nm];
+        NSString *lower = name.lowercaseString;
+        if ([lower containsString:@"device"] ||
+            [lower containsString:@"array"] ||
+            [lower containsString:@"ble"]) {
+            [hits addObject:name];
+        }
+    }
+    if (props) free(props);
+    YCYLog(@"libBlueTooth 相关 property: %@",
+           hits.count ? [hits componentsJoinedByString:@", "] : @"(无)");
+}
+
+static BOOL YCYSeedPluginMap(id plugin, NSString *key, NSString *deviceId, CBPeripheral *peripheral) {
+    @try {
+        id existing = [plugin valueForKey:key];
+        if (existing && ![existing isKindOfClass:[NSMutableDictionary class]]) {
+            YCYLog(@"%@ 类型不可写 class=%@", key, NSStringFromClass([existing class]));
+            return NO;
+        }
+        NSMutableDictionary *devices = existing ?: [NSMutableDictionary dictionary];
+        devices[deviceId] = peripheral;
+        [plugin setValue:devices forKey:key];
+        YCYLog(@"已注入 %@ key=%@ count=%lu",
+               key, deviceId, (unsigned long)devices.count);
+        return YES;
+    } @catch (NSException *ex) {
+        YCYLog(@"注入 %@ 失败: %@", key, ex.reason);
+        return NO;
+    }
+}
+
+static BOOL YCYSeedDeviceMaps(CBPeripheral *peripheral) {
+    id plugin = gLibBT;
+    if (!plugin) plugin = YCYFindLibBT();
+    if (plugin) gLibBT = plugin;
+    if (!plugin || !peripheral) {
+        YCYLog(@"deviceArray 未就绪：没有 libBlueTooth 或外设");
+        gDidSeedDevice = NO;
+        return NO;
+    }
+    NSString *deviceId = peripheral.identifier.UUIDString ?: @"";
+    if (deviceId.length == 0) {
+        YCYLog(@"deviceArray 未就绪：deviceId 为空");
+        gDidSeedDevice = NO;
+        return NO;
+    }
+    BOOL connectOk = YCYSeedPluginMap(plugin, @"connectDeviceArray", deviceId, peripheral);
+    BOOL deviceOk = YCYSeedPluginMap(plugin, @"deviceArray", deviceId, peripheral);
+    if (!deviceOk) YCYLogLibBTDeviceKeys(plugin);
+    gDidSeedDevice = deviceOk;
+    YCYLog(@"seed 结果 connect=%d da=%d seeded=%d", connectOk, deviceOk, gDidSeedDevice);
+    return gDidSeedDevice;
+}
+
+static BOOL YCYOpenBluetoothAdapter(void) {
+    if (gJSAdapterOpened) return YES;
+    BOOL ok = YCYEvalJSAll(
+        @"(function(){try{"
+        "if(typeof uni!=='undefined'&&typeof uni.openBluetoothAdapter==='function'){"
+        "uni.openBluetoothAdapter({});return 'uni.openBluetoothAdapter';}"
+        "if(typeof plus!=='undefined'&&plus.bluetooth&&typeof plus.bluetooth.openBluetoothAdapter==='function'){"
+        "plus.bluetooth.openBluetoothAdapter({});return 'plus.openBluetoothAdapter';}"
+        "return 'adapter:miss';"
+        "}catch(e){return 'err:'+String(e);}})()",
+        @"JS adapter", @"uni.open");
+    if (ok) gJSAdapterOpened = YES;
+    return ok;
+}
+
+static BOOL YCYEnsureColdStartStack(void) {
+    YCYOpenBluetoothAdapter();
+    CBPeripheral *p = lastAppPeripheral;
+    if (!p) p = YCYRetrieveLockPeripheral();
+    return YCYSeedDeviceMaps(p);
+}
+
+static __attribute__((unused)) BOOL YCYInvokeLibBT(NSString *selName, NSDictionary *opts) {
     id plugin = YCYFindLibBT();
     if (!plugin) {
         YCYLog(@"没有 libBlueTooth，跳过 %@", selName);
@@ -1886,10 +1929,8 @@ static BOOL YCYInvokeLibBT(NSString *selName, NSDictionary *opts) {
         YCYLog(@"libBlueTooth 无 %@", selName);
         return NO;
     }
-    NSString *fn = [selName hasSuffix:@":"] ? [selName substringToIndex:selName.length - 1] : selName;
-    id arg = YCYMakePGCommand(fn, opts);
-    YCYLog(@"invoke [%@ %@] deviceId=%@",
-           NSStringFromClass([plugin class]), selName, opts[@"deviceId"] ?: @"-");
+    id arg = YCYMakePGCommand(opts);
+    YCYLog(@"invoke [libBlueTooth %@] %@", selName, opts[@"deviceId"] ?: @"");
     @try {
         NSMethodSignature *sig = [plugin methodSignatureForSelector:sel];
         if (!sig || sig.numberOfArguments < 3) return NO;
@@ -1906,215 +1947,6 @@ static BOOL YCYInvokeLibBT(NSString *selName, NSDictionary *opts) {
     }
 }
 
-static NSMutableDictionary *YCYMutableIvarDict(id obj, NSArray<NSString *> *names) {
-    if (!obj) return nil;
-    for (NSString *name in names) {
-        @try {
-            id v = [obj valueForKey:name];
-            if ([v isKindOfClass:[NSMutableDictionary class]]) return v;
-            if ([v isKindOfClass:[NSDictionary class]]) {
-                NSMutableDictionary *m = [v mutableCopy];
-                [obj setValue:m forKey:name];
-                return m;
-            }
-        } @catch (__unused NSException *e) {}
-        Ivar iv = class_getInstanceVariable([obj class], name.UTF8String);
-        if (!iv) continue;
-        id v = object_getIvar(obj, iv);
-        if ([v isKindOfClass:[NSMutableDictionary class]]) return v;
-        if ([v isKindOfClass:[NSDictionary class]]) {
-            NSMutableDictionary *m = [v mutableCopy];
-            object_setIvar(obj, iv, m);
-            return m;
-        }
-    }
-    return nil;
-}
-
-static NSMutableDictionary *YCYEnsureMutableDict(id obj, NSArray<NSString *> *names) {
-    NSMutableDictionary *existing = YCYMutableIvarDict(obj, names);
-    if (existing) return existing;
-    if (!obj) return nil;
-    NSMutableDictionary *created = [NSMutableDictionary dictionary];
-    for (NSString *name in names) {
-        @try {
-            [obj setValue:created forKey:name];
-            YCYLog(@"新建字典 %@", name);
-            return created;
-        } @catch (__unused NSException *e) {}
-        Ivar iv = class_getInstanceVariable([obj class], name.UTF8String);
-        if (iv) {
-            object_setIvar(obj, iv, created);
-            YCYLog(@"ivar 写入 %@", name);
-            return created;
-        }
-    }
-    return nil;
-}
-
-static BOOL YCYSeedLibBTDevice(CBPeripheral *p) {
-    if (!p) return NO;
-    id plugin = YCYFindLibBT();
-    if (!plugin) {
-        YCYLog(@"seed 失败：没有 libBlueTooth");
-        return NO;
-    }
-    NSString *uuid = p.identifier.UUIDString;
-    NSDictionary *item = @{
-        @"CBPeripheral": p,
-        @"advNode": @{
-            @"kCBAdvDataLocalName": YCYPeripheralName(p)
-        }
-    };
-    NSMutableDictionary *da = YCYEnsureMutableDict(plugin, @[@"deviceArray", @"_deviceArray"]);
-    if (da) {
-        da[uuid] = item;
-        gDidSeedDevice = YES;
-        YCYLog(@"已注入 deviceArray key=%@ count=%lu", uuid, (unsigned long)da.count);
-    } else {
-        YCYLog(@"seed：读不到 deviceArray");
-    }
-    if (p.state == CBPeripheralStateConnected) {
-        NSMutableDictionary *ca = YCYEnsureMutableDict(plugin, @[@"connectDeviceArray", @"_connectDeviceArray"]);
-        if (ca) {
-            ca[uuid] = p;
-            YCYLog(@"已注入 connectDeviceArray key=%@ count=%lu", uuid, (unsigned long)ca.count);
-        }
-    }
-    return da != nil;
-}
-
-static void YCYLogColdState(NSString *tag) {
-    id plugin = YCYFindLibBT();
-    NSUInteger da = 0, ca = 0;
-    if (plugin) {
-        NSDictionary *d = YCYMutableIvarDict(plugin, @[@"deviceArray", @"_deviceArray"]);
-        NSDictionary *c = YCYMutableIvarDict(plugin, @[@"connectDeviceArray", @"_connectDeviceArray"]);
-        da = d.count;
-        ca = c.count;
-    }
-    NSUInteger nctx = 0;
-    @synchronized (jsContexts) { nctx = jsContexts.allObjects.count; }
-    YCYLog(@"cold[%@] v%@ uuid=%@ name=%@ frozen=%d hello=%lu plugin=%@ da=%lu ca=%lu central=%@ cState=%ld jsCtx=%lu lastApp=%@ pState=%ld adapter=%d seeded=%d",
-           tag,
-           kYCYVersion,
-           lastLockUUID.UUIDString ?: @"(无)",
-           lastLockName ?: @"(无)",
-           gCanonicalFrozen,
-           (unsigned long)gHelloPayload.length,
-           plugin ? NSStringFromClass([plugin class]) : @"nil",
-           (unsigned long)da,
-           (unsigned long)ca,
-           appCentral ? @"yes" : @"no",
-           appCentral ? (long)appCentral.state : -1,
-           (unsigned long)nctx,
-           YCYPeripheralName(lastAppPeripheral),
-           lastAppPeripheral ? (long)lastAppPeripheral.state : -1,
-           gJSAdapterOpened,
-           gDidSeedDevice);
-}
-
-static BOOL YCYFireJSConnected(void) {
-    NSString *uuid = lastLockUUID.UUIDString ?: @"";
-    if (uuid.length == 0) return NO;
-    NSString *script = [NSString stringWithFormat:
-        @"(function(){try{"
-        "var ev={deviceId:'%@',connected:true};"
-        "if(typeof uni!=='undefined'&&typeof uni.$emit==='function'){uni.$emit('BLEConnectionStateChange',ev);}"
-        "return 'fired';"
-        "}catch(e){return 'err:'+String(e);}})()", uuid];
-    return YCYEvalJSAll(script, @"JS connected-event", @"fired");
-}
-
-static BOOL YCYJSHasFn(NSString *namesCsv) {
-    NSString *script = [NSString stringWithFormat:
-        @"(function(g){try{"
-        "var names='%@'.split(',');"
-        "for(var i=0;i<names.length;i++){"
-        "var n=names[i];"
-        "if(typeof g['__ycy_'+n]==='function')return 'has-trap:'+n;"
-        "if(typeof g[n]==='function')return 'has:'+n;"
-        "if(typeof this[n]==='function')return 'has-this:'+n;}"
-        "if(typeof uni!=='undefined')return 'uni-only';"
-        "return 'none';"
-        "}catch(e){return 'err:'+String(e);}})(this)", namesCsv];
-    NSArray *ctxs;
-    @synchronized (jsContexts) { ctxs = [[jsContexts allObjects] copy]; }
-    if (ctxs.count == 0) return NO;
-    gInJSProbe = YES;
-    BOOL ok = NO;
-    for (JSContext *ctx in ctxs) {
-        @try {
-            JSValue *v = [ctx evaluateScript:script];
-            NSString *s = v.isString ? v.toString : @"nil";
-            YCYLog(@"JS hasFn %@ → %@", namesCsv, s);
-            if ([s hasPrefix:@"has"]) ok = YES;
-        } @catch (__unused NSException *ex) {}
-    }
-    gInJSProbe = NO;
-    return ok;
-}
-
-static BOOL YCYEnsureColdStartStack(void) {
-    YCYLogColdState(@"ensure-begin");
-    BOOL jsAdapter = YCYTryJSOpenAdapter();
-    BOOL nativeAdapter = YCYInvokeLibBT(@"openBluetoothAdapter:", @{});
-    if (jsAdapter || nativeAdapter) gJSAdapterOpened = YES;
-
-    YCYFindDCBLE();
-    CBPeripheral *p = YCYRetrieveLockPeripheral();
-    if (!p && lastLockUUID) {
-        CBCentralManager *c = YCYAnyCentral();
-        if (c) {
-            NSArray *known = [c retrievePeripheralsWithIdentifiers:@[lastLockUUID]];
-            p = known.firstObject;
-            if (p) {
-                YCYRememberPeripheral(p);
-                lastAppPeripheral = p;
-            }
-        }
-    }
-    BOOL seeded = NO;
-    if (p) seeded = YCYSeedLibBTDevice(p);
-
-    BOOL started = NO;
-    if (p && p.state != CBPeripheralStateConnected) {
-        started = YCYTryNativeConnect();
-        if (!started) started = YCYConnectViaAppCentral();
-    } else if (p && p.state == CBPeripheralStateConnected) {
-        YCYSeedLibBTDevice(p);
-        started = YES;
-    }
-
-    NSDictionary *opts = @{
-        @"deviceId": lastLockUUID.UUIDString ?: @"",
-        @"timeout": @20000
-    };
-    BOOL nativeConn = NO;
-    if (lastLockUUID) {
-        nativeConn = YCYInvokeLibBT(@"createBLEConnection:", opts);
-    }
-    BOOL jsConn = YCYTryJSConnect();
-    if (p && p.state == CBPeripheralStateConnected) {
-        YCYFireJSConnected();
-    }
-    YCYLogColdState(@"ensure-end");
-    YCYLog(@"cold stack adapterJS=%d adapterNative=%d seeded=%d nativeConn=%d jsConn=%d started=%d peri=%@ state=%ld",
-           jsAdapter, nativeAdapter, seeded, nativeConn, jsConn, started,
-           YCYPeripheralName(p), p ? (long)p.state : -1);
-    return started || jsConn || nativeConn || seeded;
-}
-
-static void YCYWarmupBLE(NSString *reason) {
-    YCYLog(@"BLE 预热 reason=%@", reason);
-    YCYTryJSOpenAdapter();
-    YCYInvokeLibBT(@"openBluetoothAdapter:", @{});
-    YCYFindDCBLE();
-    CBPeripheral *p = YCYRetrieveLockPeripheral();
-    if (p) YCYSeedLibBTDevice(p);
-    YCYLogColdState(@"warmup");
-}
-
 static BOOL YCYTryJSHandshake(void) {
     NSString *uuid = lastLockUUID.UUIDString ?: @"";
     NSString *script = [NSString stringWithFormat:
@@ -2128,14 +1960,8 @@ static BOOL YCYTryJSHandshake(void) {
         "if(typeof uni!=='undefined'&&uni.notifyBLECharacteristicValueChange){"
         "uni.notifyBLECharacteristicValueChange({deviceId:id,serviceId:svc,characteristicId:ntf,state:true});"
         "}"
-        "function call(store,raw){"
-        "var fn=g[store]||raw;"
-        "var th=g[store+'_this'];"
-        "if(typeof fn!=='function')return false;"
-        "if(th&&typeof th==='object'&&th!==g&&th!==Object.prototype){fn.call(th,'open');}"
-        "else fn('open');"
-        "return true;}"
-        "if(call('__ycy__init_ble',g._init_ble))return 'handshake:trap_init_ble';"
+        "var fn=g.__ycy__init_ble||g._init_ble;"
+        "if(typeof fn==='function'){fn('open');return 'handshake:trap_init_ble';}"
         "if(typeof _init_ble==='function'){_init_ble('open');return 'handshake:_init_ble';}"
         "return 'handshake:notify-only';"
         "}catch(e){return 'err:'+String(e);}})(this)", uuid];
@@ -2147,14 +1973,15 @@ static BOOL YCYReplayHello(CBPeripheral *p) {
         YCYLog(@"无握手首包，跳过重放 hello");
         return NO;
     }
-    if (gCanonicalFrozen) {
-        [recordLock lock];
-        NSData *fv = [canonicalWrites.firstObject.value copy];
-        [recordLock unlock];
-        if (fv && [fv isEqualToData:gHelloPayload]) {
-            YCYLog(@"拒绝重放 hello：与冻结开锁包相同 HEX=%@", YCYHexString(gHelloPayload));
-            return NO;
-        }
+    if (YCYIsFrozenPayload(gHelloPayload)) {
+        YCYLog(@"hello 与冻结开锁包相同，禁止重放 HEX=%@",
+               YCYHexString(gHelloPayload));
+        gHelloPayload = nil;
+        gHelloCharUUID = nil;
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        [ud removeObjectForKey:kYCYHelloKey];
+        [ud removeObjectForKey:kYCYHelloCharKey];
+        return NO;
     }
     CBCharacteristic *c = YCYFindCharacteristic(p, kYCYSvc9000,
         gHelloCharUUID.length ? gHelloCharUUID : kYCYChar9001);
@@ -2179,21 +2006,16 @@ static void YCYStartPostConnectHandshake(CBPeripheral *p) {
         YCYLog(@"握手延后：服务/特征尚未完整 layout=%@", p.services);
         return;
     }
-    gDidPostConnect = YES;
-    YCYLog(@"连上后开始握手 notify=%d hello=%lu chars=%lu",
-           gSessionNotifySeen, (unsigned long)gHelloPayload.length,
-           (unsigned long)gDiscoveredCharacteristicCount);
-    if (p) YCYSeedLibBTDevice(p);
-    YCYEnableNotifies(p);
-    if (p) {
-        NSDictionary *ntf = @{
-            @"deviceId": p.identifier.UUIDString ?: @"",
-            @"serviceId": kYCYSvc9000,
-            @"characteristicId": kYCYChar9002,
-            @"state": @YES
-        };
-        YCYInvokeLibBT(@"notifyBLECharacteristicValueChange:", ntf);
+    if (!gDidSeedDevice && !YCYSeedDeviceMaps(p)) {
+        YCYLog(@"deviceArray 未就绪，跳过 _init_ble 和 hello");
+        return;
     }
+    gDidPostConnect = YES;
+    YCYLog(@"连上后开始握手 notify=%d hello=%lu chars=%lu da=%d seeded=%d",
+           gSessionNotifySeen, (unsigned long)gHelloPayload.length,
+           (unsigned long)gDiscoveredCharacteristicCount,
+           gDidSeedDevice, gDidSeedDevice);
+    YCYEnableNotifies(p);
     YCYTryJSHandshake();
     if (p && p.services.count > 0) YCYReplayHello(p);
 }
@@ -2351,9 +2173,9 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
     BOOL isReady = (ready.state == CBPeripheralStateConnected);
     NSUInteger svcCount = ready.services.count;
     BOOL charsReady = YCYHasRequiredBLELayout(ready);
-    BOOL handshakeOk = gSessionNotifySeen || gSessionHandshakeWrite;
+    BOOL handshakeOk = gSessionNotifySeen;
 
-    YCYLog(@"重连轮询 #%d ready=%@ state=%ld chars=%d svcs=%lu discovered=%lu sawChars=%d didSvcs=%d notify=%d hsWrite=%d hello=%lu lastApp=%@",
+    YCYLog(@"重连轮询 #%d ready=%@ state=%ld chars=%d svcs=%lu discovered=%lu sawChars=%d didSvcs=%d notify=%d hsWrite=%d hello=%lu da=%d seeded=%d lastApp=%@",
            attempts,
            YCYPeripheralName(ready),
            ready ? (long)ready.state : -1,
@@ -2365,47 +2187,31 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
            gSessionNotifySeen,
            gSessionHandshakeWrite,
            (unsigned long)gHelloPayload.length,
+           gDidSeedDevice, gDidSeedDevice,
            YCYPeripheralName(lastAppPeripheral));
-    if (attempts == 1 || attempts == 10 || attempts == 20) {
-        YCYJSHasFn(@"_init_ble,_ble_do");
-    }
-
-    if (!isReady && (attempts == 1 || attempts == 4 || attempts == 8 || attempts == 12)) {
-        YCYLog(@"轮询 #%d 尚未连上，重跑冷启动栈", attempts);
-        YCYEnsureColdStartStack();
-    }
-    if (isReady && ready) {
-        YCYSeedLibBTDevice(ready);
-        if (attempts == 2 || attempts == 6) {
-            NSDictionary *ntf = @{
-                @"deviceId": ready.identifier.UUIDString ?: @"",
-                @"serviceId": kYCYSvc9000,
-                @"characteristicId": kYCYChar9002,
-                @"state": @YES
-            };
-            YCYInvokeLibBT(@"notifyBLECharacteristicValueChange:", ntf);
-        }
-    }
 
     if (isReady && charsReady) {
-        YCYStartPostConnectHandshake(ready);
-        YCYEnableNotifies(ready);
-        if (handshakeOk && tryJS && !gDidJSOpenThisFlight) {
-            gDidJSOpenThisFlight = YES;
-            if (YCYTryJSOpen()) {
-                YCYShowToast(@"握手完成，已调用 _ble_do");
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{ YCYFinishUnlockFlight(); });
-                return;
+        if (!gDidSeedDevice) YCYSeedDeviceMaps(ready);
+        if (!gDidSeedDevice) {
+            YCYLog(@"deviceArray 未就绪，跳过 _init_ble 和 hello");
+        } else {
+            YCYStartPostConnectHandshake(ready);
+            if (handshakeOk && tryJS && !gDidJSOpenThisFlight) {
+                gDidJSOpenThisFlight = YES;
+                if (YCYTryJSOpen()) {
+                    YCYShowToast(@"握手完成，已调用 _ble_do");
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{ YCYFinishUnlockFlight(); });
+                    return;
+                }
             }
-        }
-        if (!handshakeOk && (attempts == 3 || attempts == 7) && ready) {
-            YCYReplayHello(ready);
-            YCYTryJSHandshake();
+            if (!handshakeOk && attempts == 3 && ready) {
+                YCYReplayHello(ready);
+            }
         }
     }
 
-    if (attempts < 20) {
+    if (attempts < 12) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             YCYPollUnlockAfterReconnect(attempts + 1, tryJS);
@@ -2413,7 +2219,6 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
         return;
     }
 
-    YCYLogColdState(@"timeout");
     YCYLog(@"重连超时 notify=%d hsWrite=%d，拒绝用旧密文", gSessionNotifySeen, gSessionHandshakeWrite);
     YCYShowToast(@"已连上但没等到新握手\n请复制日志");
     YCYFinishUnlockFlight();
@@ -2442,7 +2247,6 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
            gCaptureArmed,
            YCYPeripheralName(lastAppPeripheral),
            ready ? (long)ready.state : -1);
-    YCYLogColdState(@"unlock");
 
     gUnlockInFlight = YES;
     gDidJSOpenThisFlight = NO;
@@ -2480,20 +2284,36 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
         return;
     }
 
-    YCYLog(@"冷启动/新会话：openAdapter → 注入 deviceArray → createBLEConnection → 握手 → _ble_do");
-    BOOL started = YCYEnsureColdStartStack();
-    if (appConnected) {
+    if (appConnected && !sameSession) {
+        YCYLog(@"已连接但是新会话，先注入 deviceArray 再握手");
+        YCYEnsureColdStartStack();
         YCYStartPostConnectHandshake(ready);
-        YCYShowToast(@"已连上，正在同步 JS 并握手…");
-    } else if (started) {
-        YCYShowToast(@"正在连接 YS04…\n冷启动会先打开蓝牙适配器");
-    } else {
-        YCYShowToast(@"正在尝试冷启动重连…");
+        YCYShowToast(@"已连上，正在握手…");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            YCYPollUnlockAfterReconnect(1, tryJS);
+        });
+        return;
     }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        YCYPollUnlockAfterReconnect(1, tryJS);
-    });
+
+    if (!appConnected) {
+        YCYLog(@"未连接：openBluetoothAdapter + 注入 deviceArray + 6参 DCBLE connect");
+        YCYEnsureColdStartStack();
+        BOOL started = YCYTryNativeConnect();
+        if (!started) started = YCYConnectViaAppCentral();
+        BOOL js = YCYTryJSConnect();
+        if (started || js) {
+            YCYShowToast(@"正在连接 YS04…\n连上后先握手再开锁");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                YCYPollUnlockAfterReconnect(1, tryJS);
+            });
+            return;
+        }
+        YCYFinishUnlockFlight();
+        YCYShowToast(@"无法重连\n请先打开 App 蓝牙页再试");
+        return;
+    }
 }
 
 static void YCYTryUnlock(void) {
@@ -2627,7 +2447,7 @@ static void YCYShowMenu(UIButton *sender) {
     NSArray *canon = YCYCanonicalCopy();
     NSArray *unique = YCYUniqueUnlockPackets(canon);
     NSString *msg = [NSString stringWithFormat:
-        @"短按：开锁（冷启动会先打开适配器并注入设备）\n长按：本菜单\nv%@  监控：%@\n唯一包：%lu  原始：%lu%@\n心跳：%@  捕获：%@\nUUID：%@\nhello：%lu  已连接：%lu",
+        @"短按：开锁（原生优先，同会话才重放）\n长按：本菜单\nv%@  监控：%@\n唯一包：%lu  原始：%lu%@\n心跳：%@  捕获：%@\n已连接：%lu",
         kYCYVersion,
         monitorEnabled ? @"开" : @"关",
         (unsigned long)unique.count,
@@ -2635,8 +2455,6 @@ static void YCYShowMenu(UIButton *sender) {
         gCanonicalFrozen ? @"（已冻结）" : @"",
         gHeartbeatSeen ? @"已见" : @"未见",
         gCaptureArmed ? @"进行中" : @"关",
-        lastLockUUID.UUIDString ?: @"未保存",
-        (unsigned long)gHelloPayload.length,
         (unsigned long)YCYConnectedPeripherals().count];
 
     UIAlertController *menu =
@@ -2681,17 +2499,6 @@ static void YCYShowMenu(UIButton *sender) {
                                                } else {
                                                    YCYShowToast(@"没找到 _ble_do，请看日志里的 JS probe / trap");
                                                }
-                                           }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"冷启动诊断（复制日志）"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) {
-                                               (void)a;
-                                               YCYDumpDCBLENow(@"menu-cold");
-                                               YCYLogColdState(@"menu");
-                                               YCYWarmupBLE(@"menu");
-                                               YCYJSHasFn(@"_init_ble,_ble_do,uni");
-                                               YCYCopyLogs();
-                                               YCYShowToast(@"冷启动诊断已写入日志并复制");
                                            }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"查看已记录指令"
                                              style:UIAlertActionStyleDefault
@@ -2876,32 +2683,6 @@ static void YCYScheduleFloatingButton(void) {
         YCYCreateFloatingButton();
     });
 }
-
-#pragma mark - libBlueTooth（DCloud PGPlugin）
-
-%hook libBlueTooth
-
-- (void)openBluetoothAdapter:(id)pMethod {
-    gLibBT = self;
-    gJSAdapterOpened = YES;
-    NSUInteger n = 0;
-    @try { n = [[pMethod valueForKey:@"arguments"] count]; } @catch (__unused NSException *e) {}
-    YCYLog(@"libBlueTooth openBluetoothAdapter args=%lu", (unsigned long)n);
-    %orig;
-}
-
-- (void)createBLEConnection:(id)pMethod {
-    gLibBT = self;
-    NSArray *args = nil;
-    @try { args = [pMethod valueForKey:@"arguments"]; } @catch (__unused NSException *e) {}
-    id a0 = (args.count > 0) ? args[0] : nil;
-    id a1 = (args.count > 1) ? args[1] : nil;
-    YCYLog(@"libBlueTooth createBLEConnection argc=%lu a0=%@ a1=%@",
-           (unsigned long)args.count, a0, a1);
-    %orig;
-}
-
-%end
 
 #pragma mark - CoreBluetooth Monitor + 记录
 
@@ -3126,7 +2907,6 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
                    dispatch_get_main_queue(), ^{
         YCYDumpInterestingClasses();
         YCYDumpDCBLENow(@"launch");
-        YCYWarmupBLE(@"launch");
     });
     BOOL result = %orig(application, launchOptions);
     YCYScheduleFloatingButton();
@@ -3138,10 +2918,6 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYLog(@"applicationDidBecomeActive");
     %orig;
     YCYScheduleFloatingButton();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        YCYWarmupBLE(@"becomeActive");
-    });
 }
 
 %end
@@ -3159,9 +2935,9 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.7.0 冷启动：openAdapter → 注入 deviceArray → createBLEConnection → 握手 → _ble_do");
-    YCYLog(@"短按 = 开锁（强杀后再开走完整栈）");
-    YCYLog(@"长按 = 开始捕获 / 冷启动诊断");
+    YCYLog(@"v1.7.0 冷启动注入 deviceArray，禁止冻结包当 hello，等新 NOTIFY 再 _ble_do");
+    YCYLog(@"短按 = 原生/JS，同会话才重放");
+    YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
     YCYScheduleFloatingButton();
 }
