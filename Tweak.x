@@ -5,7 +5,7 @@
 #import <objc/runtime.h>
 
 /*
- * YCYUnlock v1.7.0
+ * YCYUnlock v1.7.4
  *
  * v1.5 已打通：retrieve + 6参 connect → state=2。
  * v1.6：连上先 notify + _init_ble，等本会话新 NOTIFY 再 _ble_do。断电重连可用。
@@ -17,6 +17,12 @@
  *   冷启动：retrieve 注入 deviceDict + connectDeviceArray
  *   → createBLEConnection → notify → _init_ble → 等新包 → _ble_do。
  *   禁止把冻结开锁密文当 hello 重放。
+ *
+ * v1.7.4 修复 hello 捕获不可达：
+ *   hello 捕获原来锁在 !gCaptureArmed 里，「开始捕获」后整段跳过，
+ *   导致 hello 永远为 0，重连后无首包可喂 → 锁不回挑战 → notify=0 死锁。
+ *   现在改为：会话第一条 16 字节写入（锁尚未发过任何 NOTIFY）无论是否
+ *   手动捕获都单独记为 hello，并从开锁包中剔除；重连时先喂 hello 再 _init_ble。
  */
 
 #pragma mark - 常量（YS04 / Walkiz）
@@ -34,7 +40,7 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.7.3";
+static NSString * const kYCYVersion = @"1.7.4";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -72,6 +78,7 @@ static BOOL gDidJSOpenThisFlight = NO;
 static BOOL gJSAdapterOpened = NO;
 static BOOL gDidSeedDevice = NO;
 static BOOL gDidEnableNotifies = NO;
+static BOOL gDidHelloThisSession = NO;
 static NSData *gHelloPayload;
 static NSString *gHelloCharUUID;
 static NSDate *gHandshakeUntil;
@@ -910,6 +917,7 @@ static void YCYNoteNewSession(NSString *reason) {
     gDidPostConnect = NO;
     gDidSeedDevice = NO;
     gDidEnableNotifies = NO;
+    gDidHelloThisSession = NO;
     [recordLock lock];
     [liveSession removeAllObjects];
     [payloadCounts removeAllObjects];
@@ -1384,6 +1392,24 @@ static void YCYRecordWrite(CBPeripheral *peripheral,
         gSessionHandshakeWrite = YES;
     }
 
+    // 会话首包（hello）：本会话第一条 16 字节写入，且锁尚未发过任何 NOTIFY。
+    // 无论是否「手动捕获」，都必须单独记下；重连后靠它触发锁的挑战。
+    BOOL isHelloWrite = NO;
+    if (!gDidHelloThisSession && data.length == 16 && !gSessionNotifySeen) {
+        gDidHelloThisSession = YES;
+        if (YCYIsFrozenPayload(data)) {
+            YCYLog(@"拒绝把已冻结开锁包当 hello HEX=%@", hex);
+        } else {
+            isHelloWrite = YES;
+            BOOL changed = (gHelloPayload != nil) && ![gHelloPayload isEqualToData:data];
+            gHelloPayload = [data copy];
+            gHelloCharUUID = charUUID;
+            YCYLog(@"记住握手首包(会话首写) char=%@ HEX=%@%@",
+                   charUUID, hex, changed ? @" [与上次不同→hello 不稳定]" : @"");
+            YCYPersistRecords();
+        }
+    }
+
     [recordLock lock];
     NSInteger seen = [payloadCounts[hex] integerValue] + 1;
     payloadCounts[hex] = @(seen);
@@ -1398,7 +1424,7 @@ static void YCYRecordWrite(CBPeripheral *peripheral,
         return;
     }
 
-    BOOL handshakeSkip = NO;
+    BOOL handshakeSkip = isHelloWrite;
     if (!gCaptureArmed) {
         if (gHandshakeWritesLeft > 0) {
             gHandshakeWritesLeft--;
@@ -1409,18 +1435,8 @@ static void YCYRecordWrite(CBPeripheral *peripheral,
         }
     }
     if (handshakeSkip) {
-        if (!gHelloPayload &&
-            data.length == 16 &&
-            !YCYIsFrozenPayload(data)) {
-            gHelloPayload = [data copy];
-            gHelloCharUUID = charUUID;
-            YCYLog(@"记住握手首包 char=%@ HEX=%@", charUUID, hex);
-            YCYPersistRecords();
-        } else if (YCYIsFrozenPayload(data)) {
-            YCYLog(@"拒绝把冻结开锁包保存为 hello HEX=%@", hex);
-        }
-        YCYLog(@"握手/建会话，跳过记录 left=%ld hb=%d HEX=%@",
-               (long)gHandshakeWritesLeft, gHeartbeatSeen, hex);
+        YCYLog(@"握手/建会话，跳过记录 left=%ld hb=%d hello=%d HEX=%@",
+               (long)gHandshakeWritesLeft, gHeartbeatSeen, isHelloWrite, hex);
         lastLockUUID = peripheral.identifier;
         lastLockName = YCYPeripheralName(peripheral);
         return;
@@ -2039,8 +2055,8 @@ static void YCYStartPostConnectHandshake(CBPeripheral *p) {
            (unsigned long)gDiscoveredCharacteristicCount,
            gDidSeedDevice, gDidSeedDevice);
     YCYEnableNotifies(p);
-    YCYTryJSHandshake();
     if (p && p.services.count > 0) YCYReplayHello(p);
+    YCYTryJSHandshake();
 }
 
 #pragma mark - 自建 BLE 连接（仅发现/保活，禁止写旧密文）
@@ -2486,73 +2502,73 @@ static void YCYShowMenu(UIButton *sender) {
                                      preferredStyle:UIAlertControllerStyleActionSheet];
 
     [menu addAction:[UIAlertAction actionWithTitle:gCaptureArmed ? @"停止捕获" : @"开始捕获（推荐）"
-                                             style:UIAlertActionStyleDestructive
-                                           handler:^(UIAlertAction *a) {
-                                               (void)a;
-                                               if (gCaptureArmed) {
-                                                   gCaptureArmed = NO;
-                                                   YCYShowToast(@"已停止捕获");
-                                               } else {
-                                                   YCYArmCapture();
-                                               }
-                                           }]];
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *a) {
+                                                (void)a;
+                                                if (gCaptureArmed) {
+                                                    gCaptureArmed = NO;
+                                                    YCYShowToast(@"已停止捕获");
+                                                } else {
+                                                    YCYArmCapture();
+                                                }
+                                            }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"仅调用 DCBLEManager 开锁"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) {
-                                               (void)a;
-                                               YCYDumpDCBLENow(@"menu-native-open");
-                                               if (YCYTryNativeOpen()) {
-                                                   YCYShowToast(@"已调用 DCBLEManager");
-                                               } else {
-                                                   YCYShowToast(@"没匹配到方法，请复制日志");
-                                               }
-                                           }]];
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+                                                (void)a;
+                                                YCYDumpDCBLENow(@"menu-native-open");
+                                                if (YCYTryNativeOpen()) {
+                                                    YCYShowToast(@"已调用 DCBLEManager");
+                                                } else {
+                                                    YCYShowToast(@"没匹配到方法，请复制日志");
+                                                }
+                                            }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"仅重放唯一 BLE 包（同会话）"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) {
-                                               (void)a;
-                                               YCYTryUnlockWithBurst(nil, NO);
-                                           }]];
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+                                                (void)a;
+                                                YCYTryUnlockWithBurst(nil, NO);
+                                            }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"仅触发 App 内部开锁"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) {
-                                               (void)a;
-                                               if (YCYTryJSOpen()) {
-                                                   YCYShowToast(@"已调用 App 内部开锁接口");
-                                               } else {
-                                                   YCYShowToast(@"没找到 _ble_do，请看日志里的 JS probe / trap");
-                                               }
-                                           }]];
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+                                                (void)a;
+                                                if (YCYTryJSOpen()) {
+                                                    YCYShowToast(@"已调用 App 内部开锁接口");
+                                                } else {
+                                                    YCYShowToast(@"没找到 _ble_do，请看日志里的 JS probe / trap");
+                                                }
+                                            }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"查看已记录指令"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) {
-                                               (void)a;
-                                               YCYShowRecords();
-                                           }]];
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+                                                (void)a;
+                                                YCYShowRecords();
+                                            }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"查看 BLE 日志"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) {
-                                               (void)a;
-                                               YCYShowLogs();
-                                           }]];
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+                                                (void)a;
+                                                YCYShowLogs();
+                                            }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"复制 BLE 日志"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) {
-                                               (void)a;
-                                               YCYCopyLogs();
-                                           }]];
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+                                                (void)a;
+                                                YCYCopyLogs();
+                                            }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"清空日志"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) {
-                                               (void)a;
-                                               YCYClearLogs();
-                                           }]];
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+                                                (void)a;
+                                                YCYClearLogs();
+                                            }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"重新捕获（清空已冻结包）"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) {
-                                               (void)a;
-                                               YCYClearRecords();
-                                           }]];
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+                                                (void)a;
+                                                YCYClearRecords();
+                                            }]];
     [menu addAction:[UIAlertAction
         actionWithTitle:monitorEnabled ? @"关闭监控" : @"开启监控"
                   style:UIAlertActionStyleDefault
@@ -2563,8 +2579,8 @@ static void YCYShowMenu(UIButton *sender) {
                     YCYShowToast(monitorEnabled ? @"监控已开启" : @"监控已关闭");
                 }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"取消"
-                                             style:UIAlertActionStyleCancel
-                                           handler:nil]];
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
 
     if (menu.popoverPresentationController) {
         menu.popoverPresentationController.sourceView = sender ?: floatButton;
@@ -2958,7 +2974,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.7.3 在当前页面上调用 _init_ble，等新 NOTIFY 再 _ble_do");
+    YCYLog(@"v1.7.4 会话首写自动记为 hello，重连先喂 hello 再 _init_ble");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
