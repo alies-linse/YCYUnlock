@@ -34,7 +34,7 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.7.1";
+static NSString * const kYCYVersion = @"1.7.2";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -1967,9 +1967,16 @@ static BOOL YCYTryJSHandshake(void) {
         "if(typeof uni!=='undefined'&&uni.notifyBLECharacteristicValueChange){"
         "uni.notifyBLECharacteristicValueChange({deviceId:id,serviceId:svc,characteristicId:ntf,state:true});"
         "}"
-        "var fn=g.__ycy__init_ble||g._init_ble;"
-        "if(typeof fn==='function'){fn('open');return 'handshake:trap_init_ble';}"
-        "if(typeof _init_ble==='function'){_init_ble('open');return 'handshake:_init_ble';}"
+        "function call(fn,host,how){"
+        "if(typeof fn!=='function')return '';"
+        "var n=0;try{n=fn.length;}catch(e){}"
+        "if(n>=2){fn.call(host,'open',{play_id:0});}"
+        "else{fn.call(host,'open');}"
+        "return how+':arity='+n;"
+        "}"
+        "var hit=call(g.__ycy__init_ble,g,'trap');"
+        "if(!hit)hit=call(g._init_ble,g,'global');"
+        "if(hit)return 'handshake:'+hit;"
         "return 'handshake:notify-only';"
         "}catch(e){return 'err:'+String(e);}})(this)", uuid];
     return YCYEvalJSAll(script, @"JS handshake", @"handshake:");
@@ -2942,7 +2949,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.7.1 冷启动注入 deviceDict，禁止冻结包当 hello，等新 NOTIFY 再 _ble_do");
+    YCYLog(@"v1.7.2 deviceDict 注入后按方法调用 _init_ble，等新 NOTIFY 再 _ble_do");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
