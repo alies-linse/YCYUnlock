@@ -10,11 +10,11 @@
  * v1.5 已打通：retrieve + 6参 connect → state=2。
  * v1.6：连上先 notify + _init_ble，等本会话新 NOTIFY 再 _ble_do。断电重连可用。
  *
- * v1.7 强杀 App 后再开：
- *   libBlueTooth.createBLEConnection 必须在 deviceArray 找到 deviceId，
- *   否则 10002 no device，JS _init_ble 只扫不写（零 WRITE / 零 NOTIFY）。
- *   划掉进程后 deviceArray / connectDeviceArray / _mBleManager 全空。
- *   冷启动：openBluetoothAdapter → retrieve 注入 deviceArray
+ * v1.7.1 强杀 App 后再开：
+ *   libBlueTooth 没有 deviceArray。运行时 property 是 deviceDict
+ *   与 connectDeviceArray。createBLEConnection 查的是 deviceDict，
+ *   只写 connectDeviceArray 时 da=0，JS _init_ble 只扫不写。
+ *   冷启动：retrieve 注入 deviceDict + connectDeviceArray
  *   → createBLEConnection → notify → _init_ble → 等新包 → _ble_do。
  *   禁止把冻结开锁密文当 hello 重放。
  */
@@ -34,7 +34,7 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.7.0";
+static NSString * const kYCYVersion = @"1.7.1";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -1864,8 +1864,14 @@ static BOOL YCYSeedPluginMap(id plugin, NSString *key, NSString *deviceId, CBPer
         NSMutableDictionary *devices = existing ?: [NSMutableDictionary dictionary];
         devices[deviceId] = peripheral;
         [plugin setValue:devices forKey:key];
+        id check = [plugin valueForKey:key];
+        id stored = [check isKindOfClass:[NSDictionary class]] ? ((NSDictionary *)check)[deviceId] : nil;
+        if (stored != peripheral) {
+            YCYLog(@"注入 %@ 后回读不一致 stored=%@", key, stored);
+            return NO;
+        }
         YCYLog(@"已注入 %@ key=%@ count=%lu",
-               key, deviceId, (unsigned long)devices.count);
+               key, deviceId, (unsigned long)[(NSDictionary *)check count]);
         return YES;
     } @catch (NSException *ex) {
         YCYLog(@"注入 %@ 失败: %@", key, ex.reason);
@@ -1878,18 +1884,19 @@ static BOOL YCYSeedDeviceMaps(CBPeripheral *peripheral) {
     if (!plugin) plugin = YCYFindLibBT();
     if (plugin) gLibBT = plugin;
     if (!plugin || !peripheral) {
-        YCYLog(@"deviceArray 未就绪：没有 libBlueTooth 或外设");
+        YCYLog(@"deviceDict 未就绪：没有 libBlueTooth 或外设");
         gDidSeedDevice = NO;
         return NO;
     }
     NSString *deviceId = peripheral.identifier.UUIDString ?: @"";
     if (deviceId.length == 0) {
-        YCYLog(@"deviceArray 未就绪：deviceId 为空");
+        YCYLog(@"deviceDict 未就绪：deviceId 为空");
         gDidSeedDevice = NO;
         return NO;
     }
     BOOL connectOk = YCYSeedPluginMap(plugin, @"connectDeviceArray", deviceId, peripheral);
-    BOOL deviceOk = YCYSeedPluginMap(plugin, @"deviceArray", deviceId, peripheral);
+    /* 运行时确认：libBlueTooth 没有 deviceArray，createBLEConnection 查 deviceDict。 */
+    BOOL deviceOk = YCYSeedPluginMap(plugin, @"deviceDict", deviceId, peripheral);
     if (!deviceOk) YCYLogLibBTDeviceKeys(plugin);
     gDidSeedDevice = deviceOk;
     YCYLog(@"seed 结果 connect=%d da=%d seeded=%d", connectOk, deviceOk, gDidSeedDevice);
@@ -2007,7 +2014,7 @@ static void YCYStartPostConnectHandshake(CBPeripheral *p) {
         return;
     }
     if (!gDidSeedDevice && !YCYSeedDeviceMaps(p)) {
-        YCYLog(@"deviceArray 未就绪，跳过 _init_ble 和 hello");
+        YCYLog(@"deviceDict 未就绪，跳过 _init_ble 和 hello");
         return;
     }
     gDidPostConnect = YES;
@@ -2193,7 +2200,7 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
     if (isReady && charsReady) {
         if (!gDidSeedDevice) YCYSeedDeviceMaps(ready);
         if (!gDidSeedDevice) {
-            YCYLog(@"deviceArray 未就绪，跳过 _init_ble 和 hello");
+            YCYLog(@"deviceDict 未就绪，跳过 _init_ble 和 hello");
         } else {
             YCYStartPostConnectHandshake(ready);
             if (handshakeOk && tryJS && !gDidJSOpenThisFlight) {
@@ -2285,7 +2292,7 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
     }
 
     if (appConnected && !sameSession) {
-        YCYLog(@"已连接但是新会话，先注入 deviceArray 再握手");
+        YCYLog(@"已连接但是新会话，先注入 deviceDict 再握手");
         YCYEnsureColdStartStack();
         YCYStartPostConnectHandshake(ready);
         YCYShowToast(@"已连上，正在握手…");
@@ -2297,7 +2304,7 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
     }
 
     if (!appConnected) {
-        YCYLog(@"未连接：openBluetoothAdapter + 注入 deviceArray + 6参 DCBLE connect");
+        YCYLog(@"未连接：openBluetoothAdapter + 注入 deviceDict + 6参 DCBLE connect");
         YCYEnsureColdStartStack();
         BOOL started = YCYTryNativeConnect();
         if (!started) started = YCYConnectViaAppCentral();
@@ -2935,7 +2942,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.7.0 冷启动注入 deviceArray，禁止冻结包当 hello，等新 NOTIFY 再 _ble_do");
+    YCYLog(@"v1.7.1 冷启动注入 deviceDict，禁止冻结包当 hello，等新 NOTIFY 再 _ble_do");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
