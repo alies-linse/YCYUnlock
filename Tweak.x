@@ -37,7 +37,7 @@ static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
 static NSString * const kYCYBtStateKey = @"YCYUnlock.btState";
-static NSString * const kYCYVersion = @"1.8.9";
+static NSString * const kYCYVersion = @"1.9.0";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -1827,6 +1827,25 @@ static NSString * const kYCYJSDirectNotifyScript =
     "return 'startnotify:miss';"
     "}catch(e){return 'err:'+String(e);}})(this)";
 
+// v1.9.0 重复开锁：已连接时只发令牌请求（不调 _init_ble，避免多发一次 _ble_do("open")）。
+// 设 do_scene="open" 后，锁回通知时 App 的 _do_notify 会命中 do_scene 发唯一一次开锁。
+static NSString * const kYCYJSRetokenScript =
+    @"(function(g){try{"
+    "var pg=(typeof getCurrentPages==='function')?getCurrentPages():[];"
+    "var vm=null;"
+    "for(var i=pg.length-1;i>=0;i--){var v=pg[i]&&(pg[i].$vm||pg[i]);if(v&&v.vuex_bt){vm=v;break;}}"
+    "if(!vm)return 'retoken:no-vm';"
+    "var msg='';"
+    "try{if(!vm.vuex_lock_info&&vm.$u&&vm.$u.vuex){vm.$u.vuex('lock_info',{localName:'YS04',name:'YS04',deviceId:vm.vuex_bt.did});}}catch(e){}"
+    "try{var li=vm.vuex_lock_info;if(li){li.localName='YS04';if(!li.deviceId)li.deviceId=vm.vuex_bt.did;msg+='li+';}}catch(e){}"
+    "try{vm.do_scene='open';msg+='scene+';}catch(e){msg+='scene-';}"
+    "try{vm.vuex_bt.is_con=true;}catch(e){}"
+    "try{if(typeof uni!=='undefined'&&uni.onBLECharacteristicValueChange){"
+    "uni.onBLECharacteristicValueChange(function(n){try{vm._do_notify(n);}catch(e){}});msg+='cb+';}}catch(e){}"
+    "try{vm._ble_do('token');msg+='token+';}catch(e){msg+='token-';}"
+    "return 'retoken:'+msg;"
+    "}catch(e){return 'err:'+String(e);}})(this)";
+
 static void YCYLogScriptNeedle(NSString *script, NSString *needle) {
     if (script.length == 0 || needle.length == 0) return;
     NSRange r = [script rangeOfString:needle];
@@ -1961,6 +1980,10 @@ static BOOL YCYEvalJSAll(NSString *script, NSString *tag, NSString *successPrefi
     }
     gInJSProbe = NO;
     return ok;
+}
+
+static BOOL YCYTryJSRetoken(void) {
+    return YCYEvalJSAll(kYCYJSRetokenScript, @"JS retoken", @"retoken:");
 }
 
 static BOOL YCYTryJSDirectConnect(void) {
@@ -2533,11 +2556,19 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
         }
     });
 
-    if (appConnected && sameSession && tryJS && YCYTryJSOpen()) {
-        YCYShowToast(@"同会话，已调用 _ble_do");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)),
+    // v1.9.0：已连接的重复开锁——统一走「do_scene + 令牌请求」单次路径，
+    // 让 App 的 _do_notify 在锁回通知时发唯一一次 _ble_do("open")。
+    // 不再调 _init_ble：它在 is_con=true 时会自己先发一次 _ble_do("open")，
+    // 加上 notify 那次共两次，YS04 就会「开→合」翻转。
+    // 这样连点多次都是各自完整开一次，不需要退出 App 重进。
+    if (appConnected && tryJS) {
+        YCYLog(@"已连接：单次开锁路径（do_scene + _ble_do(token)）");
+        YCYEnsureColdStartStack();
+        YCYTryJSRetoken();
+        YCYShowToast(@"正在开锁…");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            YCYFinishUnlockFlight();
+            YCYPollUnlockAfterReconnect(1, tryJS);
         });
         return;
     }
@@ -3237,7 +3268,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.8.9 加护栏：本轮已开锁则不重复下发（避免开→合翻转）");
+    YCYLog(@"v1.9.0 已连接重复开锁统一走单次路径（do_scene+_ble_do(token)）");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
