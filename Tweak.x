@@ -5,19 +5,19 @@
 #import <objc/runtime.h>
 
 /*
- * YCYUnlock v1.8.0
+ * YCYUnlock v1.8.2
  *
  * v1.5 已打通：retrieve + 6参 connect → state=2。
  * v1.6：连上先 notify + _init_ble，等本会话新 NOTIFY 再 _ble_do。断电重连可用。
  * v1.7.x：冷启动蓝牙就绪重连 / 日志落盘 / 数字 play_id / 不原生强连（修卡死）。
+ * v1.8.0/1.8.1：源码确认 _ble_do("token")=令牌请求、_ble_do("open")=真开锁。
  *
- * v1.8.0 真正的开锁协议（从 app-service.js 源码反推）：
- *   开锁不是重放密文，而是 App 自己两步：
- *     1) _ble_do("token")  → _ble_write("0100")（YS04）发 token 请求；
- *     2) 锁回加密通知，App notify 处理器用 _tp_uni_jm(my) 解密 → 写入 vuex_bt.token；
- *     3) _ble_do("open")   → _ble_write("2001"+_tp_uni_jm(mm)+"ffffffff"+token) 真正开锁。
- *   本版改为：连接后调 _ble_do("token") 发请求，等 notify+write 后调 _ble_do("open")。
- *   _init_ble("open",{play_id}) 只是「申请开锁」（置 do_scene+连接），不是解锁。
+ * v1.8.2 根因修复：
+ *   插件之前用 createBLEConnection 直连，只连了外设、没走 App 的搜索流程，
+ *   导致 App 内部 vuex_bt（did/mac/sid/wid/device.my）全是空 → _ble_write 写不出去。
+ *   _init_ble("open") 内部会：搜索设备→填 vuex_bt→连接→1s后 _ble_do("token")→
+ *   notify 解密存 token→do_scene 触发 _ble_do("open") 自动开锁。
+ *   本版改为：未连接时只调 _init_ble("open")，让 App 自己走完整流程，插件不再自己驱动。
  */
 
 #pragma mark - 常量（YS04 / Walkiz）
@@ -35,7 +35,7 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.8.1";
+static NSString * const kYCYVersion = @"1.8.2";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -1825,7 +1825,7 @@ static BOOL YCYTryJSOpen(void) {
     return opened;
 }
 
-static BOOL YCYTryJSToken(void) {
+static __attribute__((unused)) BOOL YCYTryJSToken(void) {
     NSArray *ctxs;
     @synchronized (jsContexts) {
         ctxs = [[jsContexts allObjects] copy];
@@ -1876,7 +1876,7 @@ static BOOL YCYEvalJSAll(NSString *script, NSString *tag, NSString *successPrefi
     return ok;
 }
 
-static BOOL YCYTryJSConnect(void) {
+static __attribute__((unused)) BOOL YCYTryJSConnect(void) {
     NSString *uuid = lastLockUUID.UUIDString ?: @"";
     if (uuid.length == 0) {
         YCYLog(@"JS connect 没有 lastLockUUID");
@@ -2041,7 +2041,7 @@ static __attribute__((unused)) BOOL YCYInvokeLibBT(NSString *selName, NSDictiona
     }
 }
 
-static __attribute__((unused)) BOOL YCYTryJSHandshake(void) {
+static BOOL YCYTryJSHandshake(void) {
     NSString *uuid = lastLockUUID.UUIDString ?: @"";
     NSString *script = [NSString stringWithFormat:
         @"(function(g){try{"
@@ -2134,8 +2134,8 @@ static void YCYStartPostConnectHandshake(CBPeripheral *p) {
            (unsigned long)gDiscoveredCharacteristicCount,
            gDidSeedDevice, gDidSeedDevice);
     YCYEnableNotifies(p);
-    // v1.8.0：连接后先发 token 请求（_ble_do("token")），让锁回通知、App 解密写入 token。
-    YCYTryJSToken();
+    // v1.8.2：已连接就再调一次 _init_ble("open")（is_con=true 会直接 _ble_do("open") 开锁）。
+    YCYTryJSHandshake();
 }
 
 #pragma mark - 自建 BLE 连接（仅发现/保活，禁止写旧密文）
@@ -2315,29 +2315,19 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
         if (cm && cm.state == CBManagerStatePoweredOn &&
             (attempts == 1 || attempts == 4 || attempts == 8)) {
             YCYLog(@"蓝牙已就绪，重试让 App 连接 attempts=%d state=%ld", attempts, (long)cm.state);
-            YCYTryJSConnect();
+            YCYTryJSHandshake();
         }
     }
 
     if (isReady && charsReady) {
         if (!gDidSeedDevice) YCYSeedDeviceMaps(ready);
-        if (!gDidSeedDevice) {
-            YCYLog(@"deviceDict 未就绪，跳过 _init_ble 和 hello");
-        } else {
-            YCYStartPostConnectHandshake(ready);
-            if (handshakeOk && tryJS && !gDidJSOpenThisFlight) {
-                gDidJSOpenThisFlight = YES;
-                if (YCYTryJSOpen()) {
-                    YCYShowToast(@"握手完成，已调用 _ble_do");
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), ^{ YCYFinishUnlockFlight(); });
-                    return;
-                }
-            }
-            if (!handshakeOk && attempts == 3 && ready) {
-                YCYLog(@"令牌未就绪，重试 token 请求");
-                YCYTryJSToken();
-            }
+        // App 已由 _init_ble("open") 自己完成 搜索→填 vuex_bt→连接→token→开锁，
+        // 插件只观察，不再自己驱动 _ble_do/token。
+        if (handshakeOk && !gDidJSOpenThisFlight) {
+            gDidJSOpenThisFlight = YES;
+            YCYLog(@"已观察到 token 交换完成，App 应已自动开锁");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ YCYFinishUnlockFlight(); });
         }
     }
 
@@ -2436,10 +2426,10 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
     }
 
     if (!appConnected) {
-        YCYLog(@"未连接：openBluetoothAdapter + 注入 deviceDict + createBLEConnection 连接");
+        YCYLog(@"未连接：驱动 _init_ble(open) 让 App 自己搜索+连接+token+开锁");
         YCYEnsureColdStartStack();
-        YCYTryJSConnect();
-        YCYShowToast(@"正在让 App 连接 YS04…\n连上后自动 token+开锁");
+        YCYTryJSHandshake();
+        YCYShowToast(@"正在让 App 连接 YS04…\nApp 会自己完成开锁");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             YCYPollUnlockAfterReconnect(1, tryJS);
@@ -3076,7 +3066,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.8.1 token 脚本带 vuex_bt 状态探针");
+    YCYLog(@"v1.8.2 未连接只调 _init_ble(open)，让 App 自己搜索+连接+开锁");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
