@@ -36,7 +36,7 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.8.3";
+static NSString * const kYCYVersion = @"1.8.4";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -2320,8 +2320,7 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
     if (!isReady) {
         CBCentralManager *cm = YCYAnyCentral();
         if (cm && cm.state == CBManagerStatePoweredOn &&
-            (attempts == 1 || attempts == 3 || attempts == 5 ||
-             attempts == 7 || attempts == 9 || attempts == 11)) {
+            (attempts == 1 || attempts == 8)) {
             YCYLog(@"蓝牙已就绪，重试驱动 _init_ble attempts=%d state=%ld", attempts, (long)cm.state);
             YCYTryJSHandshake();
         }
@@ -3082,7 +3081,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.8.3 等蓝牙上电再驱动 _init_ble，并先清 is_lock_ble_connecting 守卫");
+    YCYLog(@"v1.8.4 重试减到 2 次（减少状态错误弹窗），等源码定位 open 分支");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
