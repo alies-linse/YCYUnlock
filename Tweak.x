@@ -5,7 +5,7 @@
 #import <objc/runtime.h>
 
 /*
- * YCYUnlock v1.7.4
+ * YCYUnlock v1.7.5
  *
  * v1.5 已打通：retrieve + 6参 connect → state=2。
  * v1.6：连上先 notify + _init_ble，等本会话新 NOTIFY 再 _ble_do。断电重连可用。
@@ -23,6 +23,13 @@
  *   导致 hello 永远为 0，重连后无首包可喂 → 锁不回挑战 → notify=0 死锁。
  *   现在改为：会话第一条 16 字节写入（锁尚未发过任何 NOTIFY）无论是否
  *   手动捕获都单独记为 hello，并从开锁包中剔除；重连时先喂 hello 再 _init_ble。
+ *
+ * v1.7.5 冷启动（强杀后）：
+ *   - 蓝牙冷启动 state=0、retrieve=0、libBlueTooth 未就绪，首次连接必失败；
+ *     轮询里等蓝牙 PoweredOn 后重试连接（retrieve 拿不到就扫描）。
+ *   - 源码确认 _init_ble 真实签名是 _init_ble("open",{play_id:n.r.id})，
+ *     需要 play_id；trap 捕获到的 fn.length=0 不可靠，改为从页面 VM 抓
+ *     play_id（r.id / play_id / playId / pid），抓到就用 ("open",{play_id}) 驱动。
  */
 
 #pragma mark - 常量（YS04 / Walkiz）
@@ -40,7 +47,7 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.7.4";
+static NSString * const kYCYVersion = @"1.7.5";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -1688,10 +1695,22 @@ static NSString * const kYCYJSTrapScript =
 
 static NSString * const kYCYJSOpenScript =
     @"(function(g){try{"
+    "function ypid(vm){try{if(!vm)return '';"
+    "if(vm.r&&vm.r.id!=null)return ''+vm.r.id;"
+    "if(vm.play_id!=null)return ''+vm.play_id;"
+    "if(vm.playId!=null)return ''+vm.playId;"
+    "if(vm.pid!=null)return ''+vm.pid;"
+    "if(vm.$data){if(vm.$data.r&&vm.$data.r.id!=null)return ''+vm.$data.r.id;"
+    "if(vm.$data.play_id!=null)return ''+vm.$data.play_id;"
+    "if(vm.$data.playId!=null)return ''+vm.$data.playId;}"
+    "}catch(e){}return '';}"
+    "var p='';"
+    "try{if(typeof getCurrentPages==='function'){var pg=getCurrentPages()||[];"
+    "for(var i=pg.length-1;i>=0;i--){var vm=pg[i]&&(pg[i].$vm||pg[i]);p=ypid(vm);if(p)break;}}}catch(e){}"
     "var fn=g.__ycy__ble_do||g._ble_do||g.__ycy_ble_do;"
-    "if(typeof fn==='function'){fn('open');return 'opened:trap_ble_do';}"
-    "if(typeof _ble_do==='function'){_ble_do('open');return 'opened:_ble_do';}"
-    "return 'miss';"
+    "if(typeof fn==='function'){if(p){fn('open',{play_id:p});}else{fn('open');}return 'opened:trap_ble_do'+(p?':pid='+p:'');}"
+    "if(typeof _ble_do==='function'){if(p){_ble_do('open',{play_id:p});}else{_ble_do('open');}return 'opened:_ble_do'+(p?':pid='+p:'');}"
+    "return 'miss'+(p?':pid='+p:'');"
     "}catch(e){return 'err:'+String(e);}})(this)";
 
 static void YCYLogScriptNeedle(NSString *script, NSString *needle) {
@@ -1983,26 +2002,34 @@ static BOOL YCYTryJSHandshake(void) {
         "if(typeof uni!=='undefined'&&uni.notifyBLECharacteristicValueChange){"
         "uni.notifyBLECharacteristicValueChange({deviceId:id,serviceId:svc,characteristicId:ntf,state:true});"
         "}"
-        "function call(fn,host,how){"
+        "function ypid(vm){try{if(!vm)return '';"
+        "if(vm.r&&vm.r.id!=null)return ''+vm.r.id;"
+        "if(vm.play_id!=null)return ''+vm.play_id;"
+        "if(vm.playId!=null)return ''+vm.playId;"
+        "if(vm.pid!=null)return ''+vm.pid;"
+        "if(vm.$data){if(vm.$data.r&&vm.$data.r.id!=null)return ''+vm.$data.r.id;"
+        "if(vm.$data.play_id!=null)return ''+vm.$data.play_id;"
+        "if(vm.$data.playId!=null)return ''+vm.$data.playId;}"
+        "}catch(e){}return '';}"
+        "function call(fn,host,how,pid){"
         "if(typeof fn!=='function')return '';"
-        "var n=0;try{n=fn.length;}catch(e){}"
         "try{"
-        "if(n>=2){fn.call(host,'open',{play_id:0});}"
-        "else{fn.call(host,'open');}"
-        "return how+':arity='+n;"
+        "if(pid){fn.call(host,'open',{play_id:pid});return how+':pid='+pid;}"
+        "fn.call(host,'open');return how+':no-pid';"
         "}catch(e){return how+':threw:'+String(e);}"
         "}"
         "var pages=[];"
         "try{if(typeof getCurrentPages==='function')pages=getCurrentPages()||[];}catch(e){}"
-        "var hit='';"
-        "for(var i=pages.length-1;i>=0&&!hit;i--){"
+        "var hit='';var p='';"
+        "for(var i=pages.length-1;i>=0;i--){"
         "var vm=pages[i]&&(pages[i].$vm||pages[i]);"
-        "hit=call(vm&&vm._init_ble,vm,'page');"
+        "if(!p)p=ypid(vm);"
+        "if(!hit)hit=call(vm&&vm._init_ble,vm,'page',p);"
         "}"
-        "if(!hit)hit=call(g.__ycy__init_ble,g,'trap');"
-        "if(!hit)hit=call(g._init_ble,g,'global');"
+        "if(!hit)hit=call(g.__ycy__init_ble,g,'trap',p);"
+        "if(!hit)hit=call(g._init_ble,g,'global',p);"
         "if(hit)return 'handshake:'+hit+':pages='+pages.length;"
-        "return 'handshake:notify-only:pages='+pages.length;"
+        "return 'handshake:notify-only:pages='+pages.length+' pid='+p;"
         "}catch(e){return 'err:'+String(e);}})(this)", uuid];
     return YCYEvalJSAll(script, @"JS handshake", @"handshake:");
 }
@@ -2228,6 +2255,18 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
            (unsigned long)gHelloPayload.length,
            gDidSeedDevice, gDidSeedDevice,
            YCYPeripheralName(lastAppPeripheral));
+
+    // 冷启动：蓝牙可能还没 PoweredOn（state=0），首次连接必然失败。
+    // 等蓝牙就绪后重试连接（retrieve 拿不到就扫描）。
+    if (!isReady) {
+        CBCentralManager *cm = YCYAnyCentral();
+        if (cm && cm.state == CBManagerStatePoweredOn &&
+            (attempts == 1 || attempts == 4 || attempts == 8)) {
+            YCYLog(@"蓝牙已就绪，重试连接 attempts=%d state=%ld", attempts, (long)cm.state);
+            if (!YCYTryNativeConnect()) YCYConnectViaAppCentral();
+            YCYTryJSConnect();
+        }
+    }
 
     if (isReady && charsReady) {
         if (!gDidSeedDevice) YCYSeedDeviceMaps(ready);
@@ -2974,7 +3013,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.7.4 会话首写自动记为 hello，重连先喂 hello 再 _init_ble");
+    YCYLog(@"v1.7.5 冷启动等蓝牙就绪重连；_init_ble/_ble_do 带 play_id");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
