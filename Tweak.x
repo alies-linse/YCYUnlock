@@ -5,7 +5,7 @@
 #import <objc/runtime.h>
 
 /*
- * YCYUnlock v1.8.7
+ * YCYUnlock v1.8.8
  *
  * v1.5-v1.7.x：GATT 重连、hello 捕获、日志落盘、play_id、修冷启动卡死。
  * v1.8.0/1.8.1：源码确认 _ble_do("token")=令牌请求、_ble_do("open")=真开锁。
@@ -15,13 +15,16 @@
  *   device.mm/mm 与 did/sid/wid/nid，存进 NSUserDefaults；强杀重进后
  *   回填成功（日志 bridge:dev+），device 密钥完整还在。
  *
- * v1.8.7 用回填的密钥跳过服务端直连开锁：
- *   回填 vuex_bt → JS 注册 onBLECharacteristicValueChange(vm._do_notify)
- *   + 置 do_scene="open" + uni.createBLEConnection(did)
- *   → 连上后调 App 自己的 _start_notofy()（开通知→is_con=true→1s后
- *   _ble_do("token")）→ 锁回通知 → _do_notify 解密存 token
- *   → do_scene 命中 → _ble_do("open") → 开锁。
- *   前提：必须先让控方同意成功开锁过一次，让密钥被抓下来。
+ * v1.8.7 用回填的密钥跳过服务端直连开锁（实测：密钥回填 OK、连接 OK、
+ *   _start_notofy OK、App 自己写出令牌请求，但锁不回通知）。
+ *
+ * v1.8.8 修机型判断：
+ *   _ble_do 用 this.vuex_lock_info.localName 选择协议格式：
+ *     非 YS04 → _ble_write("06010101")（走错分支）
+ *     YS04   → _ble_write("0100")
+ *   冷启动只回填了 vuex_bt、没回填 vuex_lock_info，导致 localName 为空、
+ *   走了 else 分支写错格式，锁不认识所以不回通知。
+ *   本版在直连前强制补 lock_info={localName:'YS04',name:'YS04',deviceId}。
  */
 
 #pragma mark - 常量（YS04 / Walkiz）
@@ -40,7 +43,7 @@ static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
 static NSString * const kYCYBtStateKey = @"YCYUnlock.btState";
-static NSString * const kYCYVersion = @"1.8.7";
+static NSString * const kYCYVersion = @"1.8.8";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -1796,6 +1799,17 @@ static NSString * const kYCYJSDirectConnectScript =
     "if(!vm)return 'direct:no-vm';"
     "if(!vm.vuex_bt.did)return 'direct:no-did';"
     "var msg='';"
+    // 关键补丁：_ble_do 用 this.vuex_lock_info.localName 判断机型，
+    // 冷启动后 lock_info 没恢复 → _is_ys0x(undefined)=false → 走 else 写
+    // "06010101"（非 YS04 格式），锁就不回通知。这里必须补上 localName=YS04。
+    "try{"
+    "if(!vm.vuex_lock_info&&vm.$u&&vm.$u.vuex){"
+    "try{vm.$u.vuex('lock_info',{localName:'YS04',name:'YS04',deviceId:vm.vuex_bt.did});}catch(e){}"
+    "}"
+    "var li=vm.vuex_lock_info;"
+    "if(li){li.localName='YS04';if(!li.name)li.name='YS04';if(!li.deviceId)li.deviceId=vm.vuex_bt.did;msg+='li+';}"
+    "else{msg+='li-';}"
+    "}catch(e){msg+='li-err';}"
     "try{if(typeof uni!=='undefined'&&uni.onBLECharacteristicValueChange){"
     "uni.onBLECharacteristicValueChange(function(n){try{vm._do_notify(n);}catch(e){}});msg+='cb+';}}"
     "catch(e){msg+='cb-';}"
@@ -1804,7 +1818,7 @@ static NSString * const kYCYJSDirectConnectScript =
     "success:function(){msg+='conn+';},"
     "fail:function(n){msg+='conn-('+(n&&n.errMsg)+')';}});}"
     "catch(e){msg+='conn-throw';}"
-    "return 'direct:'+msg+' did='+vm.vuex_bt.did;"
+    "return 'direct:'+msg+' ln='+(vm.vuex_lock_info&&vm.vuex_lock_info.localName)+' did='+vm.vuex_bt.did;"
     "}catch(e){return 'err:'+String(e);}})(this)";
 
 // 连上后调 App 自己的 _start_notofy()：开通知 → is_con=true → 1s 后 _ble_do("token")
@@ -3218,7 +3232,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.8.7 回填密钥后直连：注册notify+do_scene+createBLEConnection→_start_notofy");
+    YCYLog(@"v1.8.8 直连前补 lock_info.localName=YS04（修格式走错分支）");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
