@@ -5,19 +5,20 @@
 #import <objc/runtime.h>
 
 /*
- * YCYUnlock v1.8.2
+ * YCYUnlock v1.8.3
  *
  * v1.5 已打通：retrieve + 6参 connect → state=2。
  * v1.6：连上先 notify + _init_ble，等本会话新 NOTIFY 再 _ble_do。断电重连可用。
  * v1.7.x：冷启动蓝牙就绪重连 / 日志落盘 / 数字 play_id / 不原生强连（修卡死）。
  * v1.8.0/1.8.1：源码确认 _ble_do("token")=令牌请求、_ble_do("open")=真开锁。
+ * v1.8.2：改用 _init_ble("open") 让 App 自己搜索→填 vuex_bt→连接→token→开锁。
  *
- * v1.8.2 根因修复：
- *   插件之前用 createBLEConnection 直连，只连了外设、没走 App 的搜索流程，
- *   导致 App 内部 vuex_bt（did/mac/sid/wid/device.my）全是空 → _ble_write 写不出去。
- *   _init_ble("open") 内部会：搜索设备→填 vuex_bt→连接→1s后 _ble_do("token")→
- *   notify 解密存 token→do_scene 触发 _ble_do("open") 自动开锁。
- *   本版改为：未连接时只调 _init_ble("open")，让 App 自己走完整流程，插件不再自己驱动。
+ * v1.8.3 修 _init_ble 被守卫卡死：
+ *   _init_ble 开头有 if(this.is_lock_ble_connecting) return; 防重入守卫。
+ *   冷启动蓝牙还没上电时调用，它的 openBluetoothAdapter 成功回调不触发，
+ *   守卫一直 true → 后续所有重试被挡掉，一次搜索都没发起（v1.8.2 实测）。
+ *   本版：① 蓝牙没 PoweredOn 时不调 _init_ble；② 每次驱动前先清守卫和
+ *   bt_retry_count_play；③ 轮询放宽到 20 次、每 2 秒重试一次。
  */
 
 #pragma mark - 常量（YS04 / Walkiz）
@@ -35,7 +36,7 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.8.2";
+static NSString * const kYCYVersion = @"1.8.3";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -2076,7 +2077,13 @@ static BOOL YCYTryJSHandshake(void) {
         "for(var i=pages.length-1;i>=0;i--){"
         "var vm=pages[i]&&(pages[i].$vm||pages[i]);"
         "if(p==null)p=ypid(vm);"
-        "if(!hit)hit=call(vm&&vm._init_ble,vm,'page',p);"
+        "if(!hit){"
+        // _init_ble 开头有防重入守卫 is_lock_ble_connecting，上一次失败会卡住不返回，
+        // 这里先清掉守卫再调，否则后续重试全被挡掉。
+        "try{if(vm&&vm.is_lock_ble_connecting)vm.is_lock_ble_connecting=false;"
+        "if(vm&&vm.bt_retry_count_play!=null)vm.bt_retry_count_play=0;}catch(e){}"
+        "hit=call(vm&&vm._init_ble,vm,'page',p);"
+        "}"
         "}"
         "if(!hit)hit=call(g.__ycy__init_ble,g,'trap',p);"
         "if(!hit)hit=call(g._init_ble,g,'global',p);"
@@ -2309,12 +2316,13 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
            YCYPeripheralName(lastAppPeripheral));
 
     // 冷启动：蓝牙可能还没 PoweredOn（state=0），首次连接必然失败。
-    // 等蓝牙就绪后重试，改用 JS 驱动（原生 6参 connect 冷启动会卡死 DCBLEManager）。
+    // 等蓝牙就绪后重试驱动 _init_ble（脚本里会先清 is_lock_ble_connecting 守卫）。
     if (!isReady) {
         CBCentralManager *cm = YCYAnyCentral();
         if (cm && cm.state == CBManagerStatePoweredOn &&
-            (attempts == 1 || attempts == 4 || attempts == 8)) {
-            YCYLog(@"蓝牙已就绪，重试让 App 连接 attempts=%d state=%ld", attempts, (long)cm.state);
+            (attempts == 1 || attempts == 3 || attempts == 5 ||
+             attempts == 7 || attempts == 9 || attempts == 11)) {
+            YCYLog(@"蓝牙已就绪，重试驱动 _init_ble attempts=%d state=%ld", attempts, (long)cm.state);
             YCYTryJSHandshake();
         }
     }
@@ -2331,7 +2339,7 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
         }
     }
 
-    if (attempts < 12) {
+    if (attempts < 20) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             YCYPollUnlockAfterReconnect(attempts + 1, tryJS);
@@ -2428,7 +2436,15 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
     if (!appConnected) {
         YCYLog(@"未连接：驱动 _init_ble(open) 让 App 自己搜索+连接+token+开锁");
         YCYEnsureColdStartStack();
-        YCYTryJSHandshake();
+        CBCentralManager *cm0 = YCYAnyCentral();
+        if (cm0 && cm0.state == CBManagerStatePoweredOn) {
+            YCYTryJSHandshake();
+        } else {
+            // 蓝牙没上电时调 _init_ble 会让它的成功回调不触发，
+            // 守卫 is_lock_ble_connecting 卡 true，后续重试全被挡掉。
+            YCYLog(@"蓝牙未就绪 state=%ld，等轮询里上电后再驱动 _init_ble",
+                   cm0 ? (long)cm0.state : -1);
+        }
         YCYShowToast(@"正在让 App 连接 YS04…\nApp 会自己完成开锁");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -3066,7 +3082,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.8.2 未连接只调 _init_ble(open)，让 App 自己搜索+连接+开锁");
+    YCYLog(@"v1.8.3 等蓝牙上电再驱动 _init_ble，并先清 is_lock_ble_connecting 守卫");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
