@@ -5,26 +5,20 @@
 #import <objc/runtime.h>
 
 /*
- * YCYUnlock v1.8.8
+ * YCYUnlock v1.8.9
  *
- * v1.5-v1.7.x：GATT 重连、hello 捕获、日志落盘、play_id、修冷启动卡死。
- * v1.8.0/1.8.1：源码确认 _ble_do("token")=令牌请求、_ble_do("open")=真开锁。
- * v1.8.2-1.8.4：驱动 _init_ble，修守卫卡死。
- * v1.8.5：诊断确认开锁要服务端 play/open 下发密钥 my/mm，控方不同意就「状态错误」。
- * v1.8.6：抓取 + 回填 vuex_bt —— 实测成功！正常开锁后抓到
- *   device.mm/mm 与 did/sid/wid/nid，存进 NSUserDefaults；强杀重进后
- *   回填成功（日志 bridge:dev+），device 密钥完整还在。
+ * ✅ v1.8.8 实测成功：冷启动 → 进锁控制页 → 点红钮 → 锁开了！
+ *   链路：bridge:dev+ 回填密钥 → direct:li+cb+scene+ ln=YS04 → createBLEConnection
+ *   → _start_notofy → WRITE 13 35 E9 E9…（令牌请求）→ NOTIFY（锁回）
+ *   → WRITE（密钥交换）→ WRITE E2 83 D8 61…（开锁指令）→ 锁开。
+ *   全程不需要控方同意（用之前缓存下来的密钥）。
  *
- * v1.8.7 用回填的密钥跳过服务端直连开锁（实测：密钥回填 OK、连接 OK、
- *   _start_notofy OK、App 自己写出令牌请求，但锁不回通知）。
- *
- * v1.8.8 修机型判断：
- *   _ble_do 用 this.vuex_lock_info.localName 选择协议格式：
- *     非 YS04 → _ble_write("06010101")（走错分支）
- *     YS04   → _ble_write("0100")
- *   冷启动只回填了 vuex_bt、没回填 vuex_lock_info，导致 localName 为空、
- *   走了 else 分支写错格式，锁不认识所以不回通知。
- *   本版在直连前强制补 lock_info={localName:'YS04',name:'YS04',deviceId}。
+ * v1.8.9 修「第二次点击开→合」：
+ *   YS04 开锁指令是翻转式的——已开锁状态下再发一次会「开→合」。
+ *   第二次点红钮走进 appConnected && !sameSession 分支又调了
+ *   _init_ble("open")（is_con=true 时直接 _ble_do("open")），于是重复下发。
+ *   本版加 gUnlockedOK 护栏：本轮已成功开锁就拒绝重复下发；
+ *   外设断开(state=0)时清掉标志，允许下一次再开。
  */
 
 #pragma mark - 常量（YS04 / Walkiz）
@@ -43,7 +37,7 @@ static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
 static NSString * const kYCYBtStateKey = @"YCYUnlock.btState";
-static NSString * const kYCYVersion = @"1.8.8";
+static NSString * const kYCYVersion = @"1.8.9";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -83,6 +77,7 @@ static BOOL gDidSeedDevice = NO;
 static BOOL gDidEnableNotifies = NO;
 static BOOL gDidHelloThisSession = NO;
 static BOOL gBtRestored = NO;
+static BOOL gUnlockedOK = NO;
 static NSData *gHelloPayload;
 static NSString *gHelloCharUUID;
 static NSDate *gHandshakeUntil;
@@ -2477,6 +2472,7 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
         }
         if (handshakeOk && !gDidJSOpenThisFlight) {
             gDidJSOpenThisFlight = YES;
+            gUnlockedOK = YES;
             YCYLog(@"已观察到 token 交换完成，App 应已自动开锁");
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ YCYFinishUnlockFlight(); });
@@ -2569,6 +2565,14 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
     }
 
     if (appConnected && !sameSession) {
+        if (gUnlockedOK) {
+            // v1.8.9：YS04 的开锁指令是翻转式的——已经开锁后再发一次会「开→合」。
+            // 本轮已成功开锁就拒绝重复下发。
+            YCYLog(@"本轮已开锁成功，拒绝重复下发（避免开→合翻转）");
+            YCYShowToast(@"这一轮已经开过锁了\n要再开请先断开（关掉 App 蓝牙页）再点");
+            YCYFinishUnlockFlight();
+            return;
+        }
         YCYLog(@"已连接但是新会话，先注入 deviceDict 再握手");
         YCYEnsureColdStartStack();
         YCYStartPostConnectHandshake(ready);
@@ -2895,6 +2899,7 @@ static void YCYShowMenu(UIButton *sender) {
     YCYLog(@"外设状态变化 name=%@ state=%ld", YCYPeripheralName(p), (long)state);
     if (state == CBPeripheralStateDisconnected) {
         gNeedsRediscover = YES;
+        gUnlockedOK = NO;   // 断开后允许再次开锁
         if (lastAppPeripheral == p) lastAppPeripheral = nil;
     } else if (state == CBPeripheralStateConnecting) {
         gNeedsRediscover = YES;
@@ -3232,7 +3237,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.8.8 直连前补 lock_info.localName=YS04（修格式走错分支）");
+    YCYLog(@"v1.8.9 加护栏：本轮已开锁则不重复下发（避免开→合翻转）");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
