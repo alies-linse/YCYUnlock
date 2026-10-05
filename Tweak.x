@@ -5,20 +5,23 @@
 #import <objc/runtime.h>
 
 /*
- * YCYUnlock v1.8.6
+ * YCYUnlock v1.8.7
  *
  * v1.5-v1.7.x：GATT 重连、hello 捕获、日志落盘、play_id、修冷启动卡死。
  * v1.8.0/1.8.1：源码确认 _ble_do("token")=令牌请求、_ble_do("open")=真开锁。
  * v1.8.2-1.8.4：驱动 _init_ble，修守卫卡死。
- * v1.8.5 诊断确认：_init_ble("open") 会打服务端 play/open，密钥 my/mm 由服务端
- *   下发；控方不同意就回「状态错误」，插件拿不到密钥就一个字节都写不出。
- *   实测冷启动后 vuex_bt = {"did":"","device":{},"is_con":false,...} 全空。
+ * v1.8.5：诊断确认开锁要服务端 play/open 下发密钥 my/mm，控方不同意就「状态错误」。
+ * v1.8.6：抓取 + 回填 vuex_bt —— 实测成功！正常开锁后抓到
+ *   device.mm/mm 与 did/sid/wid/nid，存进 NSUserDefaults；强杀重进后
+ *   回填成功（日志 bridge:dev+），device 密钥完整还在。
  *
- * v1.8.6 抓取 + 回填密钥：
- *   把 App 每次成功拿到的 vuex_bt（含服务端下发的 device.my/mm）抓下来存进
- *   NSUserDefaults；下次冷启动先回填进 Vuex，再判断能否跳过服务端直连。
- *   用法：先让控方同意、正常开锁成功一次（此时密钥进内存）→ 点红钮抓取 →
- *   划掉后台重进 → 点红钮（回填）→ 看 bridge result 里 device 是否还在。
+ * v1.8.7 用回填的密钥跳过服务端直连开锁：
+ *   回填 vuex_bt → JS 注册 onBLECharacteristicValueChange(vm._do_notify)
+ *   + 置 do_scene="open" + uni.createBLEConnection(did)
+ *   → 连上后调 App 自己的 _start_notofy()（开通知→is_con=true→1s后
+ *   _ble_do("token")）→ 锁回通知 → _do_notify 解密存 token
+ *   → do_scene 命中 → _ble_do("open") → 开锁。
+ *   前提：必须先让控方同意成功开锁过一次，让密钥被抓下来。
  */
 
 #pragma mark - 常量（YS04 / Walkiz）
@@ -37,7 +40,7 @@ static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
 static NSString * const kYCYBtStateKey = @"YCYUnlock.btState";
-static NSString * const kYCYVersion = @"1.8.6";
+static NSString * const kYCYVersion = @"1.8.7";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -76,6 +79,7 @@ static BOOL gJSAdapterOpened = NO;
 static BOOL gDidSeedDevice = NO;
 static BOOL gDidEnableNotifies = NO;
 static BOOL gDidHelloThisSession = NO;
+static BOOL gBtRestored = NO;
 static NSData *gHelloPayload;
 static NSString *gHelloCharUUID;
 static NSDate *gHandshakeUntil;
@@ -1783,6 +1787,37 @@ static NSString *YCYJSBridgeScript(NSString *savedJson) {
         (savedJson.length ? savedJson : @"null")];
 }
 
+// v1.8.7 跳过服务端：注册 notify 回调 + 置 do_scene + 用 App 自己的栈连接设备。
+static NSString * const kYCYJSDirectConnectScript =
+    @"(function(g){try{"
+    "var pg=(typeof getCurrentPages==='function')?getCurrentPages():[];"
+    "var vm=null;"
+    "for(var i=pg.length-1;i>=0;i--){var v=pg[i]&&(pg[i].$vm||pg[i]);if(v&&v.vuex_bt&&v.vuex_bt.did){vm=v;break;}}"
+    "if(!vm)return 'direct:no-vm';"
+    "if(!vm.vuex_bt.did)return 'direct:no-did';"
+    "var msg='';"
+    "try{if(typeof uni!=='undefined'&&uni.onBLECharacteristicValueChange){"
+    "uni.onBLECharacteristicValueChange(function(n){try{vm._do_notify(n);}catch(e){}});msg+='cb+';}}"
+    "catch(e){msg+='cb-';}"
+    "try{vm.do_scene='open';msg+='scene+';}catch(e){msg+='scene-';}"
+    "try{uni.createBLEConnection({deviceId:vm.vuex_bt.did,"
+    "success:function(){msg+='conn+';},"
+    "fail:function(n){msg+='conn-('+(n&&n.errMsg)+')';}});}"
+    "catch(e){msg+='conn-throw';}"
+    "return 'direct:'+msg+' did='+vm.vuex_bt.did;"
+    "}catch(e){return 'err:'+String(e);}})(this)";
+
+// 连上后调 App 自己的 _start_notofy()：开通知 → is_con=true → 1s 后 _ble_do("token")
+static NSString * const kYCYJSDirectNotifyScript =
+    @"(function(g){try{"
+    "var pg=(typeof getCurrentPages==='function')?getCurrentPages():[];"
+    "for(var i=pg.length-1;i>=0;i--){"
+    "var v=pg[i]&&(pg[i].$vm||pg[i]);"
+    "if(v&&typeof v._start_notofy==='function'){v._start_notofy();return 'startnotify:ok';}"
+    "}"
+    "return 'startnotify:miss';"
+    "}catch(e){return 'err:'+String(e);}})(this)";
+
 static void YCYLogScriptNeedle(NSString *script, NSString *needle) {
     if (script.length == 0 || needle.length == 0) return;
     NSRange r = [script rangeOfString:needle];
@@ -1919,6 +1954,14 @@ static BOOL YCYEvalJSAll(NSString *script, NSString *tag, NSString *successPrefi
     return ok;
 }
 
+static BOOL YCYTryJSDirectConnect(void) {
+    return YCYEvalJSAll(kYCYJSDirectConnectScript, @"JS direct-connect", @"direct:");
+}
+
+static BOOL YCYTryJSDirectNotify(void) {
+    return YCYEvalJSAll(kYCYJSDirectNotifyScript, @"JS startnotify", @"startnotify:");
+}
+
 static __attribute__((unused)) BOOL YCYTryJSDump(void) {
     return YCYEvalJSAll(kYCYJSDumpScript, @"JS dump", @"dump:");
 }
@@ -1946,6 +1989,7 @@ static BOOL YCYTryJSBridge(void) {
             YCYLog(@"JS bridge result=%@", s);
             NSRange bar = [s rangeOfString:@"|"];
             if ([s hasPrefix:@"bridge:"] && bar.location != NSNotFound) {
+                if ([s rangeOfString:@"dev+"].location != NSNotFound) gBtRestored = YES;
                 NSString *json = [s substringFromIndex:bar.location + 1];
                 if (json.length > 10) {
                     [ud setObject:json forKey:kYCYBtStateKey];
@@ -2400,20 +2444,23 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
            YCYPeripheralName(lastAppPeripheral));
 
     // 冷启动：蓝牙可能还没 PoweredOn（state=0），首次连接必然失败。
-    // 等蓝牙就绪后重试驱动 _init_ble（脚本里会先清 is_lock_ble_connecting 守卫）。
+    // 蓝牙没就绪时不做任何驱动（v1.8.7 走直连，不再调 _init_ble 打服务端）。
     if (!isReady) {
         CBCentralManager *cm = YCYAnyCentral();
-        if (cm && cm.state == CBManagerStatePoweredOn &&
-            (attempts == 1 || attempts == 8)) {
-            YCYLog(@"蓝牙已就绪，重试驱动 _init_ble attempts=%d state=%ld", attempts, (long)cm.state);
-            YCYTryJSHandshake();
+        if (cm && cm.state == CBManagerStatePoweredOn && attempts == 1 && gBtRestored) {
+            YCYLog(@"蓝牙已就绪，重试直连 attempts=%d state=%ld", attempts, (long)cm.state);
+            YCYTryJSDirectConnect();
         }
     }
 
     if (isReady && charsReady) {
         if (!gDidSeedDevice) YCYSeedDeviceMaps(ready);
-        // App 已由 _init_ble("open") 自己完成 搜索→填 vuex_bt→连接→token→开锁，
-        // 插件只观察，不再自己驱动 _ble_do/token。
+        // 连上后调 App 自己的 _start_notofy()：开通知 → is_con=true → 1s 后 _ble_do("token")
+        if (gBtRestored && !gDidPostConnect) {
+            gDidPostConnect = YES;
+            YCYLog(@"已连接，调用 _start_notofy（走 App 自己的通知+token 流程）");
+            YCYTryJSDirectNotify();
+        }
         if (handshakeOk && !gDidJSOpenThisFlight) {
             gDidJSOpenThisFlight = YES;
             YCYLog(@"已观察到 token 交换完成，App 应已自动开锁");
@@ -2520,12 +2567,21 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
     }
 
     if (!appConnected) {
-        // v1.8.5 诊断版：不驱动 _init_ble（它会打服务端 play/open，未获同意必回
-        // 「状态错误」，既不连接也刷弹窗）。本版只 dump App 状态，确认密钥是否还在。
-        YCYLog(@"未连接：诊断版，不调 _init_ble（避免服务端状态错误），只看 dump");
+        // v1.8.7：先回填上次抓到的密钥（bridge 里若返回 dev+ 说明回填成功），
+        // 再跳过服务端直连：注册 notify + do_scene + createBLEConnection。
+        YCYLog(@"未连接：回填密钥后直连（跳过服务端）restored=%d", gBtRestored);
         YCYEnsureColdStartStack();
         YCYTryJSBridge();
-        YCYShowToast(@"诊断版：已抓取 App 状态\n请复制日志");
+        if (gBtRestored) {
+            YCYTryJSDirectConnect();
+            YCYShowToast(@"已回填密钥，正在直连 YS04…");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                YCYPollUnlockAfterReconnect(1, tryJS);
+            });
+            return;
+        }
+        YCYShowToast(@"还没有缓存密钥\n请先让控方同意正常开锁一次再点红钮");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             YCYFinishUnlockFlight();
@@ -3162,7 +3218,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.8.6 抓取/回填 vuex_bt(device 密钥)：先正常开锁一次再点红钮抓取");
+    YCYLog(@"v1.8.7 回填密钥后直连：注册notify+do_scene+createBLEConnection→_start_notofy");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
