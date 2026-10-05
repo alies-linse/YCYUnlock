@@ -5,7 +5,7 @@
 #import <objc/runtime.h>
 
 /*
- * YCYUnlock v1.7.7
+ * YCYUnlock v1.7.8
  *
  * v1.5 已打通：retrieve + 6参 connect → state=2。
  * v1.6：连上先 notify + _init_ble，等本会话新 NOTIFY 再 _ble_do。断电重连可用。
@@ -35,11 +35,14 @@
  *   - play_id 只探测不传递，先拿到值（实测 play_id=247000）。
  *
  * v1.7.7 用 play_id 驱动 _init_ble/_ble_do：
- *   - play_id 保留数字类型（247000 而不是 "247000"），避免 v1.7.5 把
- *     字符串当 play_id 传导致 App 初始化异常。
- *   - 抓到 play_id 后：_init_ble("open",{play_id}) 建会话，收到挑战 App
- *     自动回写响应，再 _ble_do("open",{play_id}) 触发开锁。
- *   - 新增 20s 看门狗，软挂时强制复位「开锁中」。
+ *   - play_id 保留数字类型（247000 而不是 "247000"）。
+ *   - 20s 看门狗。
+ *
+ * v1.7.8 修复冷启动卡死（真正的根因）：
+ *   冷启动用原生 6参 connectPeripheral 强制连未初始化的 DCBLEManager 会卡死
+ *   （日志停在「发现服务完成 count=2」，之后 discoverCharacteristics 挂起）。
+ *   改为：未连接时用 play_id 驱动 App 自己的 _init_ble("open",{play_id}) 连接，
+ *   不再原生强连；蓝牙就绪重试也走 JS 驱动。
  */
 
 #pragma mark - 常量（YS04 / Walkiz）
@@ -57,7 +60,7 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.7.7";
+static NSString * const kYCYVersion = @"1.7.8";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -867,7 +870,7 @@ static BOOL YCYInvokeDCBLEConnect6(CBPeripheral *p) {
     }
 }
 
-static BOOL YCYTryNativeConnect(void) {
+static __attribute__((unused)) BOOL YCYTryNativeConnect(void) {
     CBPeripheral *p = YCYRetrieveLockPeripheral();
     BOOL started = NO;
     if (p) {
@@ -890,7 +893,7 @@ static BOOL YCYTryNativeConnect(void) {
     return NO;
 }
 
-static BOOL YCYConnectViaAppCentral(void) {
+static __attribute__((unused)) BOOL YCYConnectViaAppCentral(void) {
     if (!appCentral) {
         YCYLog(@"无 appCentral，无法让 App 自己重连");
         return NO;
@@ -2290,13 +2293,13 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
            YCYPeripheralName(lastAppPeripheral));
 
     // 冷启动：蓝牙可能还没 PoweredOn（state=0），首次连接必然失败。
-    // 等蓝牙就绪后重试连接（retrieve 拿不到就扫描）。
+    // 等蓝牙就绪后重试，改用 JS 驱动（原生 6参 connect 冷启动会卡死 DCBLEManager）。
     if (!isReady) {
         CBCentralManager *cm = YCYAnyCentral();
         if (cm && cm.state == CBManagerStatePoweredOn &&
             (attempts == 1 || attempts == 4 || attempts == 8)) {
-            YCYLog(@"蓝牙已就绪，重试连接 attempts=%d state=%ld", attempts, (long)cm.state);
-            if (!YCYTryNativeConnect()) YCYConnectViaAppCentral();
+            YCYLog(@"蓝牙已就绪，重试让 App 连接 attempts=%d state=%ld", attempts, (long)cm.state);
+            YCYTryJSHandshake();
             YCYTryJSConnect();
         }
     }
@@ -2417,21 +2420,16 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
     }
 
     if (!appConnected) {
-        YCYLog(@"未连接：openBluetoothAdapter + 注入 deviceDict + 6参 DCBLE connect");
+        YCYLog(@"未连接：openBluetoothAdapter + 注入 deviceDict + 驱动 _init_ble 连接（不原生强连）");
         YCYEnsureColdStartStack();
-        BOOL started = YCYTryNativeConnect();
-        if (!started) started = YCYConnectViaAppCentral();
-        BOOL js = YCYTryJSConnect();
-        if (started || js) {
-            YCYShowToast(@"正在连接 YS04…\n连上后先握手再开锁");
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                YCYPollUnlockAfterReconnect(1, tryJS);
-            });
-            return;
-        }
-        YCYFinishUnlockFlight();
-        YCYShowToast(@"无法重连\n请先打开 App 蓝牙页再试");
+        // 冷启动原生 6参 connect 会卡死 DCBLEManager；改用 play_id 驱动 App 自己的 _init_ble。
+        YCYTryJSHandshake();
+        YCYTryJSConnect();
+        YCYShowToast(@"正在让 App 连接 YS04…\n连上后自动握手开锁");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            YCYPollUnlockAfterReconnect(1, tryJS);
+        });
         return;
     }
 }
@@ -3064,7 +3062,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.7.7 数字 play_id 驱动 _init_ble/_ble_do + 20s 看门狗");
+    YCYLog(@"v1.7.8 未连接改用 _init_ble(play_id) 驱动，不原生强连（修冷启动卡死）");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
