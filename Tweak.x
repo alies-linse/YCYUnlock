@@ -5,7 +5,7 @@
 #import <objc/runtime.h>
 
 /*
- * YCYUnlock v1.7.5
+ * YCYUnlock v1.7.6
  *
  * v1.5 已打通：retrieve + 6参 connect → state=2。
  * v1.6：连上先 notify + _init_ble，等本会话新 NOTIFY 再 _ble_do。断电重连可用。
@@ -27,9 +27,14 @@
  * v1.7.5 冷启动（强杀后）：
  *   - 蓝牙冷启动 state=0、retrieve=0、libBlueTooth 未就绪，首次连接必失败；
  *     轮询里等蓝牙 PoweredOn 后重试连接（retrieve 拿不到就扫描）。
- *   - 源码确认 _init_ble 真实签名是 _init_ble("open",{play_id:n.r.id})，
- *     需要 play_id；trap 捕获到的 fn.length=0 不可靠，改为从页面 VM 抓
- *     play_id（r.id / play_id / playId / pid），抓到就用 ("open",{play_id}) 驱动。
+ *   - 源码确认 _init_ble 真实签名是 _init_ble("open",{play_id:n.r.id})。
+ *
+ * v1.7.6 修复冷启动卡死 + 日志丢失：
+ *   - 日志持久化到 Documents/YCYUnlock.log，App 卡死被强杀后重启仍能
+ *     「复制 BLE 日志」取回完整记录。
+ *   - 把 play_id 改回「只探测不传递」：v1.7.5 用 ("open",{play_id}) 驱动
+ *     _init_ble/_ble_do 会触发 App 完整初始化、卡死主线程。现在只把 pid
+ *     打进日志（pid=xxx），仍调用 ('open')，先拿到 play_id 值再设计安全驱动。
  */
 
 #pragma mark - 常量（YS04 / Walkiz）
@@ -47,7 +52,7 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.7.5";
+static NSString * const kYCYVersion = @"1.7.6";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -172,6 +177,17 @@ static void YCYInitState(void) {
     });
 }
 
+static NSString *YCYLogFilePath(void) {
+    static NSString *path;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *docs = dirs.firstObject ?: NSTemporaryDirectory();
+        path = [docs stringByAppendingPathComponent:@"YCYUnlock.log"];
+    });
+    return path;
+}
+
 static void YCYLog(NSString *format, ...) {
     YCYInitState();
     va_list args;
@@ -186,6 +202,18 @@ static void YCYLog(NSString *format, ...) {
     [bleLogs addObject:line];
     if (bleLogs.count > 800) {
         [bleLogs removeObjectsInRange:NSMakeRange(0, bleLogs.count - 800)];
+    }
+    // 持久化到文件：App 卡死被强杀后，重启仍能取回完整日志。
+    @autoreleasepool {
+        NSString *withNewline = [line stringByAppendingString:@"\n"];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:YCYLogFilePath()];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[withNewline dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        } else {
+            [withNewline writeToFile:YCYLogFilePath() atomically:NO encoding:NSUTF8StringEncoding error:nil];
+        }
     }
     [bleLogLock unlock];
 }
@@ -1708,8 +1736,8 @@ static NSString * const kYCYJSOpenScript =
     "try{if(typeof getCurrentPages==='function'){var pg=getCurrentPages()||[];"
     "for(var i=pg.length-1;i>=0;i--){var vm=pg[i]&&(pg[i].$vm||pg[i]);p=ypid(vm);if(p)break;}}}catch(e){}"
     "var fn=g.__ycy__ble_do||g._ble_do||g.__ycy_ble_do;"
-    "if(typeof fn==='function'){if(p){fn('open',{play_id:p});}else{fn('open');}return 'opened:trap_ble_do'+(p?':pid='+p:'');}"
-    "if(typeof _ble_do==='function'){if(p){_ble_do('open',{play_id:p});}else{_ble_do('open');}return 'opened:_ble_do'+(p?':pid='+p:'');}"
+    "if(typeof fn==='function'){fn('open');return 'opened:trap_ble_do'+(p?':pid='+p:'');}"
+    "if(typeof _ble_do==='function'){_ble_do('open');return 'opened:_ble_do'+(p?':pid='+p:'');}"
     "return 'miss'+(p?':pid='+p:'');"
     "}catch(e){return 'err:'+String(e);}})(this)";
 
@@ -2011,11 +2039,10 @@ static BOOL YCYTryJSHandshake(void) {
         "if(vm.$data.play_id!=null)return ''+vm.$data.play_id;"
         "if(vm.$data.playId!=null)return ''+vm.$data.playId;}"
         "}catch(e){}return '';}"
-        "function call(fn,host,how,pid){"
+        "function call(fn,host,how){"
         "if(typeof fn!=='function')return '';"
         "try{"
-        "if(pid){fn.call(host,'open',{play_id:pid});return how+':pid='+pid;}"
-        "fn.call(host,'open');return how+':no-pid';"
+        "fn.call(host,'open');return how;"
         "}catch(e){return how+':threw:'+String(e);}"
         "}"
         "var pages=[];"
@@ -2024,11 +2051,11 @@ static BOOL YCYTryJSHandshake(void) {
         "for(var i=pages.length-1;i>=0;i--){"
         "var vm=pages[i]&&(pages[i].$vm||pages[i]);"
         "if(!p)p=ypid(vm);"
-        "if(!hit)hit=call(vm&&vm._init_ble,vm,'page',p);"
+        "if(!hit)hit=call(vm&&vm._init_ble,vm,'page');"
         "}"
-        "if(!hit)hit=call(g.__ycy__init_ble,g,'trap',p);"
-        "if(!hit)hit=call(g._init_ble,g,'global',p);"
-        "if(hit)return 'handshake:'+hit+':pages='+pages.length;"
+        "if(!hit)hit=call(g.__ycy__init_ble,g,'trap');"
+        "if(!hit)hit=call(g._init_ble,g,'global');"
+        "if(hit)return 'handshake:'+hit+':pages='+pages.length+' pid='+p;"
         "return 'handshake:notify-only:pages='+pages.length+' pid='+p;"
         "}catch(e){return 'err:'+String(e);}})(this)", uuid];
     return YCYEvalJSAll(script, @"JS handshake", @"handshake:");
@@ -2471,14 +2498,23 @@ static void YCYShowRecords(void) {
 
 static void YCYCopyLogs(void) {
     [bleLogLock lock];
-    UIPasteboard.generalPasteboard.string = [bleLogs componentsJoinedByString:@"\n"];
+    NSString *fileText = [NSString stringWithContentsOfFile:YCYLogFilePath() encoding:NSUTF8StringEncoding error:nil];
+    NSString *out = fileText.length ? fileText : [bleLogs componentsJoinedByString:@"\n"];
     [bleLogLock unlock];
-    YCYShowToast(@"日志已复制");
+    UIPasteboard.generalPasteboard.string = out ?: @"";
+    YCYShowToast(@"日志已复制（含文件）");
 }
 
 static void YCYClearLogs(void) {
     [bleLogLock lock];
     [bleLogs removeAllObjects];
+    @autoreleasepool {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:YCYLogFilePath()];
+        if (fh) {
+            [fh truncateFileAtOffset:0];
+            [fh closeFile];
+        }
+    }
     [bleLogLock unlock];
     YCYLog(@"Logs cleared");
     YCYShowToast(@"日志已清空");
@@ -3013,7 +3049,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.7.5 冷启动等蓝牙就绪重连；_init_ble/_ble_do 带 play_id");
+    YCYLog(@"v1.7.6 日志落盘 + play_id 只探测不传递");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
