@@ -5,19 +5,20 @@
 #import <objc/runtime.h>
 
 /*
- * YCYUnlock v1.8.5
+ * YCYUnlock v1.8.6
  *
  * v1.5-v1.7.x：GATT 重连、hello 捕获、日志落盘、play_id、修冷启动卡死。
  * v1.8.0/1.8.1：源码确认 _ble_do("token")=令牌请求、_ble_do("open")=真开锁。
- * v1.8.2/1.8.3/1.8.4：改驱动 _init_ble("open")，修守卫卡死与重试。
+ * v1.8.2-1.8.4：驱动 _init_ble，修守卫卡死。
+ * v1.8.5 诊断确认：_init_ble("open") 会打服务端 play/open，密钥 my/mm 由服务端
+ *   下发；控方不同意就回「状态错误」，插件拿不到密钥就一个字节都写不出。
+ *   实测冷启动后 vuex_bt = {"did":"","device":{},"is_con":false,...} 全空。
  *
- * v1.8.5 诊断版 —— 源码揭示开锁是「服务端发钥匙」：
- *   _init_ble("open") 找到设备后调 $http.post("play/open",{id,mac,name}),
- *   .then(n => { if(n.code){ vuex_bt.device = n.data; _connect_ble(); } })
- *   —— 加密密钥 my/mm 由服务端下发，控方没同意就返回「状态错误」(
- *   n.code=0)，不连接、不写字节。所以插件绕不过服务端，除非密钥还有缓存。
- *   本版不调 _init_ble（不再刷「状态错误」弹窗），只完整 dump App 的
- *   vuex_bt（含 device）与 r.status，确认密钥是否被 $u.vuex 持久化。
+ * v1.8.6 抓取 + 回填密钥：
+ *   把 App 每次成功拿到的 vuex_bt（含服务端下发的 device.my/mm）抓下来存进
+ *   NSUserDefaults；下次冷启动先回填进 Vuex，再判断能否跳过服务端直连。
+ *   用法：先让控方同意、正常开锁成功一次（此时密钥进内存）→ 点红钮抓取 →
+ *   划掉后台重进 → 点红钮（回填）→ 看 bridge result 里 device 是否还在。
  */
 
 #pragma mark - 常量（YS04 / Walkiz）
@@ -35,7 +36,8 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.8.5";
+static NSString * const kYCYBtStateKey = @"YCYUnlock.btState";
+static NSString * const kYCYVersion = @"1.8.6";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -1755,6 +1757,32 @@ static NSString * const kYCYJSDumpScript =
     "return 'dump:'+String(out).slice(0,1500);"
     "}catch(e){return 'err:'+String(e);}})(this)";
 
+// 桥接：把上次抓到的 vuex_bt（含服务端下发的 device 密钥）回填进 App，
+// 再把当前 vuex_bt 吐回来给插件持久化。
+static NSString *YCYJSBridgeScript(NSString *savedJson) {
+    return [NSString stringWithFormat:
+        @"(function(g){try{"
+        "var saved=%@;"
+        "var pg=(typeof getCurrentPages==='function')?getCurrentPages():[];"
+        "var vm=null;"
+        "for(var i=pg.length-1;i>=0;i--){var v=pg[i]&&(pg[i].$vm||pg[i]);if(v&&v.vuex_bt){vm=v;break;}}"
+        "if(!vm)return 'bridge:no-vm';"
+        "var msg='';"
+        "if(saved&&saved.device&&Object.keys(saved.device).length){"
+        "var vy=(vm.$u&&vm.$u.vuex)?vm.$u.vuex:null;"
+        "if(vy){try{vy.call(vm.$u,'vuex_bt.device',saved.device);msg+='dev+';}catch(e){msg+='dev-';}"
+        "try{if(saved.did)vy.call(vm.$u,'vuex_bt.did',saved.did);}catch(e){}"
+        "try{if(saved.mac)vy.call(vm.$u,'vuex_bt.mac',saved.mac);}catch(e){}"
+        "try{if(saved.sid)vy.call(vm.$u,'vuex_bt.sid',saved.sid);}catch(e){}"
+        "try{if(saved.wid)vy.call(vm.$u,'vuex_bt.wid',saved.wid);}catch(e){}"
+        "try{if(saved.nid)vy.call(vm.$u,'vuex_bt.nid',saved.nid);}catch(e){}}"
+        "else{msg+='no-$u.vuex';}"
+        "}else{msg+='no-saved';}"
+        "return 'bridge:'+msg+'|'+JSON.stringify(vm.vuex_bt);"
+        "}catch(e){return 'err:'+String(e);}})(this)",
+        (savedJson.length ? savedJson : @"null")];
+}
+
 static void YCYLogScriptNeedle(NSString *script, NSString *needle) {
     if (script.length == 0 || needle.length == 0) return;
     NSRange r = [script rangeOfString:needle];
@@ -1891,8 +1919,46 @@ static BOOL YCYEvalJSAll(NSString *script, NSString *tag, NSString *successPrefi
     return ok;
 }
 
-static BOOL YCYTryJSDump(void) {
+static __attribute__((unused)) BOOL YCYTryJSDump(void) {
     return YCYEvalJSAll(kYCYJSDumpScript, @"JS dump", @"dump:");
+}
+
+// 回填上次抓到的 vuex_bt，并把当前 vuex_bt 存下来（device 密钥是关键）。
+static BOOL YCYTryJSBridge(void) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSString *saved = [ud stringForKey:kYCYBtStateKey] ?: @"";
+    YCYLog(@"bridge 已存状态长度=%lu", (unsigned long)saved.length);
+    NSString *script = YCYJSBridgeScript(saved);
+    NSArray *ctxs;
+    @synchronized (jsContexts) {
+        ctxs = [[jsContexts allObjects] copy];
+    }
+    if (ctxs.count == 0) {
+        YCYLog(@"无 JSContext，跳过 bridge");
+        return NO;
+    }
+    gInJSProbe = YES;
+    BOOL ok = NO;
+    for (JSContext *ctx in ctxs) {
+        @try {
+            JSValue *v = [ctx evaluateScript:script];
+            NSString *s = v.isString ? v.toString : @"nil";
+            YCYLog(@"JS bridge result=%@", s);
+            NSRange bar = [s rangeOfString:@"|"];
+            if ([s hasPrefix:@"bridge:"] && bar.location != NSNotFound) {
+                NSString *json = [s substringFromIndex:bar.location + 1];
+                if (json.length > 10) {
+                    [ud setObject:json forKey:kYCYBtStateKey];
+                    [ud synchronize];
+                    ok = YES;
+                }
+            }
+        } @catch (NSException *ex) {
+            YCYLog(@"JS bridge 异常: %@", ex.reason);
+        }
+    }
+    gInJSProbe = NO;
+    return ok;
 }
 
 static __attribute__((unused)) BOOL YCYTryJSConnect(void) {
@@ -2398,8 +2464,8 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
     gDidPostConnect = NO;
     YCYSetButtonBusy(YES);
 
-    // 诊断：先把 App 的 vuex_bt（含 device 密钥）与 status 完整打出来。
-    YCYTryJSDump();
+    // 桥接：回填上次抓到的密钥（若有），并把当前 vuex_bt 抓下来持久化。
+    YCYTryJSBridge();
 
     // 看门狗：20s 内没结束就强制复位，避免「开锁中」卡死（软挂时有效）。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
@@ -2458,7 +2524,7 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
         // 「状态错误」，既不连接也刷弹窗）。本版只 dump App 状态，确认密钥是否还在。
         YCYLog(@"未连接：诊断版，不调 _init_ble（避免服务端状态错误），只看 dump");
         YCYEnsureColdStartStack();
-        YCYTryJSDump();
+        YCYTryJSBridge();
         YCYShowToast(@"诊断版：已抓取 App 状态\n请复制日志");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -3096,7 +3162,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.8.5 诊断版：dump vuex_bt(含 device 密钥)，不调 _init_ble");
+    YCYLog(@"v1.8.6 抓取/回填 vuex_bt(device 密钥)：先正常开锁一次再点红钮抓取");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
