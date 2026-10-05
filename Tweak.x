@@ -5,7 +5,7 @@
 #import <objc/runtime.h>
 
 /*
- * YCYUnlock v1.7.6
+ * YCYUnlock v1.7.7
  *
  * v1.5 已打通：retrieve + 6参 connect → state=2。
  * v1.6：连上先 notify + _init_ble，等本会话新 NOTIFY 再 _ble_do。断电重连可用。
@@ -32,9 +32,14 @@
  * v1.7.6 修复冷启动卡死 + 日志丢失：
  *   - 日志持久化到 Documents/YCYUnlock.log，App 卡死被强杀后重启仍能
  *     「复制 BLE 日志」取回完整记录。
- *   - 把 play_id 改回「只探测不传递」：v1.7.5 用 ("open",{play_id}) 驱动
- *     _init_ble/_ble_do 会触发 App 完整初始化、卡死主线程。现在只把 pid
- *     打进日志（pid=xxx），仍调用 ('open')，先拿到 play_id 值再设计安全驱动。
+ *   - play_id 只探测不传递，先拿到值（实测 play_id=247000）。
+ *
+ * v1.7.7 用 play_id 驱动 _init_ble/_ble_do：
+ *   - play_id 保留数字类型（247000 而不是 "247000"），避免 v1.7.5 把
+ *     字符串当 play_id 传导致 App 初始化异常。
+ *   - 抓到 play_id 后：_init_ble("open",{play_id}) 建会话，收到挑战 App
+ *     自动回写响应，再 _ble_do("open",{play_id}) 触发开锁。
+ *   - 新增 20s 看门狗，软挂时强制复位「开锁中」。
  */
 
 #pragma mark - 常量（YS04 / Walkiz）
@@ -52,7 +57,7 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.7.6";
+static NSString * const kYCYVersion = @"1.7.7";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -1723,22 +1728,22 @@ static NSString * const kYCYJSTrapScript =
 
 static NSString * const kYCYJSOpenScript =
     @"(function(g){try{"
-    "function ypid(vm){try{if(!vm)return '';"
-    "if(vm.r&&vm.r.id!=null)return ''+vm.r.id;"
-    "if(vm.play_id!=null)return ''+vm.play_id;"
-    "if(vm.playId!=null)return ''+vm.playId;"
-    "if(vm.pid!=null)return ''+vm.pid;"
-    "if(vm.$data){if(vm.$data.r&&vm.$data.r.id!=null)return ''+vm.$data.r.id;"
-    "if(vm.$data.play_id!=null)return ''+vm.$data.play_id;"
-    "if(vm.$data.playId!=null)return ''+vm.$data.playId;}"
-    "}catch(e){}return '';}"
-    "var p='';"
+    "function ypid(vm){try{if(!vm)return null;"
+    "if(vm.r&&vm.r.id!=null)return vm.r.id;"
+    "if(vm.play_id!=null)return vm.play_id;"
+    "if(vm.playId!=null)return vm.playId;"
+    "if(vm.pid!=null)return vm.pid;"
+    "if(vm.$data){if(vm.$data.r&&vm.$data.r.id!=null)return vm.$data.r.id;"
+    "if(vm.$data.play_id!=null)return vm.$data.play_id;"
+    "if(vm.$data.playId!=null)return vm.$data.playId;}"
+    "}catch(e){}return null;}"
+    "var p=null;"
     "try{if(typeof getCurrentPages==='function'){var pg=getCurrentPages()||[];"
-    "for(var i=pg.length-1;i>=0;i--){var vm=pg[i]&&(pg[i].$vm||pg[i]);p=ypid(vm);if(p)break;}}}catch(e){}"
+    "for(var i=pg.length-1;i>=0;i--){var vm=pg[i]&&(pg[i].$vm||pg[i]);p=ypid(vm);if(p!=null)break;}}}catch(e){}"
     "var fn=g.__ycy__ble_do||g._ble_do||g.__ycy_ble_do;"
-    "if(typeof fn==='function'){fn('open');return 'opened:trap_ble_do'+(p?':pid='+p:'');}"
-    "if(typeof _ble_do==='function'){_ble_do('open');return 'opened:_ble_do'+(p?':pid='+p:'');}"
-    "return 'miss'+(p?':pid='+p:'');"
+    "if(typeof fn==='function'){if(p!=null){fn('open',{play_id:p});}else{fn('open');}return 'opened:trap_ble_do'+(p!=null?':pid='+p:'');}"
+    "if(typeof _ble_do==='function'){if(p!=null){_ble_do('open',{play_id:p});}else{_ble_do('open');}return 'opened:_ble_do'+(p!=null?':pid='+p:'');}"
+    "return 'miss'+(p!=null?':pid='+p:'');"
     "}catch(e){return 'err:'+String(e);}})(this)";
 
 static void YCYLogScriptNeedle(NSString *script, NSString *needle) {
@@ -2030,33 +2035,34 @@ static BOOL YCYTryJSHandshake(void) {
         "if(typeof uni!=='undefined'&&uni.notifyBLECharacteristicValueChange){"
         "uni.notifyBLECharacteristicValueChange({deviceId:id,serviceId:svc,characteristicId:ntf,state:true});"
         "}"
-        "function ypid(vm){try{if(!vm)return '';"
-        "if(vm.r&&vm.r.id!=null)return ''+vm.r.id;"
-        "if(vm.play_id!=null)return ''+vm.play_id;"
-        "if(vm.playId!=null)return ''+vm.playId;"
-        "if(vm.pid!=null)return ''+vm.pid;"
-        "if(vm.$data){if(vm.$data.r&&vm.$data.r.id!=null)return ''+vm.$data.r.id;"
-        "if(vm.$data.play_id!=null)return ''+vm.$data.play_id;"
-        "if(vm.$data.playId!=null)return ''+vm.$data.playId;}"
-        "}catch(e){}return '';}"
-        "function call(fn,host,how){"
+        "function ypid(vm){try{if(!vm)return null;"
+        "if(vm.r&&vm.r.id!=null)return vm.r.id;"
+        "if(vm.play_id!=null)return vm.play_id;"
+        "if(vm.playId!=null)return vm.playId;"
+        "if(vm.pid!=null)return vm.pid;"
+        "if(vm.$data){if(vm.$data.r&&vm.$data.r.id!=null)return vm.$data.r.id;"
+        "if(vm.$data.play_id!=null)return vm.$data.play_id;"
+        "if(vm.$data.playId!=null)return vm.$data.playId;}"
+        "}catch(e){}return null;}"
+        "function call(fn,host,how,pid){"
         "if(typeof fn!=='function')return '';"
         "try{"
-        "fn.call(host,'open');return how;"
+        "if(pid!=null){fn.call(host,'open',{play_id:pid});return how+':pid='+pid;}"
+        "fn.call(host,'open');return how+':no-pid';"
         "}catch(e){return how+':threw:'+String(e);}"
         "}"
         "var pages=[];"
         "try{if(typeof getCurrentPages==='function')pages=getCurrentPages()||[];}catch(e){}"
-        "var hit='';var p='';"
+        "var hit='';var p=null;"
         "for(var i=pages.length-1;i>=0;i--){"
         "var vm=pages[i]&&(pages[i].$vm||pages[i]);"
-        "if(!p)p=ypid(vm);"
-        "if(!hit)hit=call(vm&&vm._init_ble,vm,'page');"
+        "if(p==null)p=ypid(vm);"
+        "if(!hit)hit=call(vm&&vm._init_ble,vm,'page',p);"
         "}"
-        "if(!hit)hit=call(g.__ycy__init_ble,g,'trap');"
-        "if(!hit)hit=call(g._init_ble,g,'global');"
-        "if(hit)return 'handshake:'+hit+':pages='+pages.length+' pid='+p;"
-        "return 'handshake:notify-only:pages='+pages.length+' pid='+p;"
+        "if(!hit)hit=call(g.__ycy__init_ble,g,'trap',p);"
+        "if(!hit)hit=call(g._init_ble,g,'global',p);"
+        "if(hit)return 'handshake:'+hit+':pages='+pages.length;"
+        "return 'handshake:notify-only:pages='+pages.length+' pid='+(p==null?'':''+p);"
         "}catch(e){return 'err:'+String(e);}})(this)", uuid];
     return YCYEvalJSAll(script, @"JS handshake", @"handshake:");
 }
@@ -2357,6 +2363,15 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
     gDidJSOpenThisFlight = NO;
     gDidPostConnect = NO;
     YCYSetButtonBusy(YES);
+
+    // 看门狗：20s 内没结束就强制复位，避免「开锁中」卡死（软挂时有效）。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (gUnlockInFlight) {
+            YCYLog(@"看门狗：开锁流程 20s 未结束，强制复位");
+            YCYFinishUnlockFlight();
+        }
+    });
 
     if (appConnected && sameSession && tryJS && YCYTryJSOpen()) {
         YCYShowToast(@"同会话，已调用 _ble_do");
@@ -3049,7 +3064,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.7.6 日志落盘 + play_id 只探测不传递");
+    YCYLog(@"v1.7.7 数字 play_id 驱动 _init_ble/_ble_do + 20s 看门狗");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
