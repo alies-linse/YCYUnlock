@@ -35,7 +35,7 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.8.0";
+static NSString * const kYCYVersion = @"1.8.1";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -1728,10 +1728,16 @@ static NSString * const kYCYJSOpenScript =
 // 锁回加密通知后 App 的 notify 处理器解密并写入 vuex_bt.token。
 static NSString * const kYCYJSTokenScript =
     @"(function(g){try{"
+    "var dbg='';"
+    "try{var pg=(typeof getCurrentPages==='function')?getCurrentPages():[];"
+    "var vm=pg.length&&pg[pg.length-1]&&(pg[pg.length-1].$vm||pg[pg.length-1]);"
+    "if(vm&&vm.vuex_bt){dbg='is_con='+vm.vuex_bt.is_con+' did='+vm.vuex_bt.did+' mac='+vm.vuex_bt.mac+' ln='+(vm.vuex_lock_info&&vm.vuex_lock_info.localName)+' tok='+vm.vuex_bt.token;}"
+    "else{dbg='no-vuex_bt';}"
+    "}catch(e){dbg='dbg-err:'+e;}"
     "var fn=g.__ycy__ble_do||g._ble_do;"
-    "if(typeof fn==='function'){fn('token');return 'token:trap';}"
-    "if(typeof _ble_do==='function'){_ble_do('token');return 'token:global';}"
-    "return 'token:miss';"
+    "if(typeof fn==='function'){fn('token');return 'token:trap '+dbg;}"
+    "if(typeof _ble_do==='function'){_ble_do('token');return 'token:global '+dbg;}"
+    "return 'token:miss '+dbg;"
     "}catch(e){return 'err:'+String(e);}})(this)";
 
 static void YCYLogScriptNeedle(NSString *script, NSString *needle) {
@@ -3070,7 +3076,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.8.0 _ble_do(token) 发令牌请求 → _ble_do(open) 真开锁");
+    YCYLog(@"v1.8.1 token 脚本带 vuex_bt 状态探针");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
