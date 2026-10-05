@@ -5,7 +5,7 @@
 #import <objc/runtime.h>
 
 /*
- * YCYUnlock v1.7.8
+ * YCYUnlock v1.7.9
  *
  * v1.5 已打通：retrieve + 6参 connect → state=2。
  * v1.6：连上先 notify + _init_ble，等本会话新 NOTIFY 再 _ble_do。断电重连可用。
@@ -18,31 +18,17 @@
  *   → createBLEConnection → notify → _init_ble → 等新包 → _ble_do。
  *   禁止把冻结开锁密文当 hello 重放。
  *
- * v1.7.4 修复 hello 捕获不可达：
- *   hello 捕获原来锁在 !gCaptureArmed 里，「开始捕获」后整段跳过，
- *   导致 hello 永远为 0，重连后无首包可喂 → 锁不回挑战 → notify=0 死锁。
- *   现在改为：会话第一条 16 字节写入（锁尚未发过任何 NOTIFY）无论是否
- *   手动捕获都单独记为 hello，并从开锁包中剔除；重连时先喂 hello 再 _init_ble。
+ * v1.7.4 修复 hello 捕获不可达：会话首写单独记为 hello。
+ * v1.7.5 冷启动蓝牙就绪重连 + 确认 _init_ble 签名 _init_ble("open",{play_id})。
+ * v1.7.6 日志落盘 + play_id 只探测不传递。
+ * v1.7.7 数字 play_id 驱动 + 看门狗。
+ * v1.7.8 未连接改用 _init_ble(play_id) 驱动，不原生强连（修冷启动卡死）。
  *
- * v1.7.5 冷启动（强杀后）：
- *   - 蓝牙冷启动 state=0、retrieve=0、libBlueTooth 未就绪，首次连接必失败；
- *     轮询里等蓝牙 PoweredOn 后重试连接（retrieve 拿不到就扫描）。
- *   - 源码确认 _init_ble 真实签名是 _init_ble("open",{play_id:n.r.id})。
- *
- * v1.7.6 修复冷启动卡死 + 日志丢失：
- *   - 日志持久化到 Documents/YCYUnlock.log，App 卡死被强杀后重启仍能
- *     「复制 BLE 日志」取回完整记录。
- *   - play_id 只探测不传递，先拿到值（实测 play_id=247000）。
- *
- * v1.7.7 用 play_id 驱动 _init_ble/_ble_do：
- *   - play_id 保留数字类型（247000 而不是 "247000"）。
- *   - 20s 看门狗。
- *
- * v1.7.8 修复冷启动卡死（真正的根因）：
- *   冷启动用原生 6参 connectPeripheral 强制连未初始化的 DCBLEManager 会卡死
- *   （日志停在「发现服务完成 count=2」，之后 discoverCharacteristics 挂起）。
- *   改为：未连接时用 play_id 驱动 App 自己的 _init_ble("open",{play_id}) 连接，
- *   不再原生强连；蓝牙就绪重试也走 JS 驱动。
+ * v1.7.9 不再抢着重放 hello：
+ *   插件先重放 hello 会让 App 的 _init_ble 状态机错乱——锁回了挑战，
+ *   App 却不回写响应密文（hsWrite=0），导致「显示开锁成功但锁没开」。
+ *   改为让 _init_ble 自己写 hello + 收挑战 + 回响应，插件只在握手没完成时
+ *   重试驱动 _init_ble。
  */
 
 #pragma mark - 常量（YS04 / Walkiz）
@@ -60,7 +46,7 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.7.8";
+static NSString * const kYCYVersion = @"1.7.9";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -2070,7 +2056,7 @@ static BOOL YCYTryJSHandshake(void) {
     return YCYEvalJSAll(script, @"JS handshake", @"handshake:");
 }
 
-static BOOL YCYReplayHello(CBPeripheral *p) {
+static __attribute__((unused)) BOOL YCYReplayHello(CBPeripheral *p) {
     if (!gHelloPayload.length || !p) {
         YCYLog(@"无握手首包，跳过重放 hello");
         return NO;
@@ -2118,7 +2104,7 @@ static void YCYStartPostConnectHandshake(CBPeripheral *p) {
            (unsigned long)gDiscoveredCharacteristicCount,
            gDidSeedDevice, gDidSeedDevice);
     YCYEnableNotifies(p);
-    if (p && p.services.count > 0) YCYReplayHello(p);
+    // v1.7.9：不再抢着重放 hello，让 _init_ble 自己写 hello + 收挑战 + 回响应。
     YCYTryJSHandshake();
 }
 
@@ -2320,7 +2306,8 @@ static void YCYPollUnlockAfterReconnect(int attempts, BOOL tryJS) {
                 }
             }
             if (!handshakeOk && attempts == 3 && ready) {
-                YCYReplayHello(ready);
+                YCYLog(@"握手未完成，重试驱动 _init_ble（不重放 hello）");
+                YCYTryJSHandshake();
             }
         }
     }
@@ -3062,7 +3049,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.7.8 未连接改用 _init_ble(play_id) 驱动，不原生强连（修冷启动卡死）");
+    YCYLog(@"v1.7.9 不重放 hello，让 _init_ble 自己写 hello+挑战+响应");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
