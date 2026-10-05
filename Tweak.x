@@ -5,20 +5,19 @@
 #import <objc/runtime.h>
 
 /*
- * YCYUnlock v1.8.3
+ * YCYUnlock v1.8.5
  *
- * v1.5 已打通：retrieve + 6参 connect → state=2。
- * v1.6：连上先 notify + _init_ble，等本会话新 NOTIFY 再 _ble_do。断电重连可用。
- * v1.7.x：冷启动蓝牙就绪重连 / 日志落盘 / 数字 play_id / 不原生强连（修卡死）。
+ * v1.5-v1.7.x：GATT 重连、hello 捕获、日志落盘、play_id、修冷启动卡死。
  * v1.8.0/1.8.1：源码确认 _ble_do("token")=令牌请求、_ble_do("open")=真开锁。
- * v1.8.2：改用 _init_ble("open") 让 App 自己搜索→填 vuex_bt→连接→token→开锁。
+ * v1.8.2/1.8.3/1.8.4：改驱动 _init_ble("open")，修守卫卡死与重试。
  *
- * v1.8.3 修 _init_ble 被守卫卡死：
- *   _init_ble 开头有 if(this.is_lock_ble_connecting) return; 防重入守卫。
- *   冷启动蓝牙还没上电时调用，它的 openBluetoothAdapter 成功回调不触发，
- *   守卫一直 true → 后续所有重试被挡掉，一次搜索都没发起（v1.8.2 实测）。
- *   本版：① 蓝牙没 PoweredOn 时不调 _init_ble；② 每次驱动前先清守卫和
- *   bt_retry_count_play；③ 轮询放宽到 20 次、每 2 秒重试一次。
+ * v1.8.5 诊断版 —— 源码揭示开锁是「服务端发钥匙」：
+ *   _init_ble("open") 找到设备后调 $http.post("play/open",{id,mac,name}),
+ *   .then(n => { if(n.code){ vuex_bt.device = n.data; _connect_ble(); } })
+ *   —— 加密密钥 my/mm 由服务端下发，控方没同意就返回「状态错误」(
+ *   n.code=0)，不连接、不写字节。所以插件绕不过服务端，除非密钥还有缓存。
+ *   本版不调 _init_ble（不再刷「状态错误」弹窗），只完整 dump App 的
+ *   vuex_bt（含 device）与 r.status，确认密钥是否被 $u.vuex 持久化。
  */
 
 #pragma mark - 常量（YS04 / Walkiz）
@@ -36,7 +35,7 @@ static NSString * const kYCYLockUUIDKey = @"YCYUnlock.lastLockUUID";
 static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
-static NSString * const kYCYVersion = @"1.8.4";
+static NSString * const kYCYVersion = @"1.8.5";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -1741,6 +1740,21 @@ static NSString * const kYCYJSTokenScript =
     "return 'token:miss '+dbg;"
     "}catch(e){return 'err:'+String(e);}})(this)";
 
+// 诊断：完整 dump App 的 vuex_bt（含 device 密钥）与 r.status。
+static NSString * const kYCYJSDumpScript =
+    @"(function(g){try{"
+    "var out='';"
+    "try{"
+    "var pg=(typeof getCurrentPages==='function')?getCurrentPages():[];"
+    "var vm=pg.length&&pg[pg.length-1]&&(pg[pg.length-1].$vm||pg[pg.length-1]);"
+    "if(vm){"
+    "out+='status='+(vm.r&&vm.r.status)+' play_id='+(vm.r&&vm.r.id)+' ';"
+    "try{out+='bt='+JSON.stringify(vm.vuex_bt);}catch(e){out+='bt=err';}"
+    "}else{out='no-vm';}"
+    "}catch(e){out='err:'+e;}"
+    "return 'dump:'+String(out).slice(0,1500);"
+    "}catch(e){return 'err:'+String(e);}})(this)";
+
 static void YCYLogScriptNeedle(NSString *script, NSString *needle) {
     if (script.length == 0 || needle.length == 0) return;
     NSRange r = [script rangeOfString:needle];
@@ -1875,6 +1889,10 @@ static BOOL YCYEvalJSAll(NSString *script, NSString *tag, NSString *successPrefi
     }
     gInJSProbe = NO;
     return ok;
+}
+
+static BOOL YCYTryJSDump(void) {
+    return YCYEvalJSAll(kYCYJSDumpScript, @"JS dump", @"dump:");
 }
 
 static __attribute__((unused)) BOOL YCYTryJSConnect(void) {
@@ -2380,6 +2398,9 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
     gDidPostConnect = NO;
     YCYSetButtonBusy(YES);
 
+    // 诊断：先把 App 的 vuex_bt（含 device 密钥）与 status 完整打出来。
+    YCYTryJSDump();
+
     // 看门狗：20s 内没结束就强制复位，避免「开锁中」卡死（软挂时有效）。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -2433,21 +2454,15 @@ static void YCYTryUnlockWithBurst(NSArray *burst, BOOL tryJS) {
     }
 
     if (!appConnected) {
-        YCYLog(@"未连接：驱动 _init_ble(open) 让 App 自己搜索+连接+token+开锁");
+        // v1.8.5 诊断版：不驱动 _init_ble（它会打服务端 play/open，未获同意必回
+        // 「状态错误」，既不连接也刷弹窗）。本版只 dump App 状态，确认密钥是否还在。
+        YCYLog(@"未连接：诊断版，不调 _init_ble（避免服务端状态错误），只看 dump");
         YCYEnsureColdStartStack();
-        CBCentralManager *cm0 = YCYAnyCentral();
-        if (cm0 && cm0.state == CBManagerStatePoweredOn) {
-            YCYTryJSHandshake();
-        } else {
-            // 蓝牙没上电时调 _init_ble 会让它的成功回调不触发，
-            // 守卫 is_lock_ble_connecting 卡 true，后续重试全被挡掉。
-            YCYLog(@"蓝牙未就绪 state=%ld，等轮询里上电后再驱动 _init_ble",
-                   cm0 ? (long)cm0.state : -1);
-        }
-        YCYShowToast(@"正在让 App 连接 YS04…\nApp 会自己完成开锁");
+        YCYTryJSDump();
+        YCYShowToast(@"诊断版：已抓取 App 状态\n请复制日志");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            YCYPollUnlockAfterReconnect(1, tryJS);
+            YCYFinishUnlockFlight();
         });
         return;
     }
@@ -3081,7 +3096,7 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"==============================");
     YCYLog(@"YCYUnlock loaded v%@", kYCYVersion);
-    YCYLog(@"v1.8.4 重试减到 2 次（减少状态错误弹窗），等源码定位 open 分支");
+    YCYLog(@"v1.8.5 诊断版：dump vuex_bt(含 device 密钥)，不调 _init_ble");
     YCYLog(@"短按 = 原生/JS，同会话才重放");
     YCYLog(@"长按 = 开始捕获 / dump");
     YCYLog(@"==============================");
