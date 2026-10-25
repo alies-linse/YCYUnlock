@@ -3,6 +3,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <JavaScriptCore/JavaScriptCore.h>
 #import <objc/runtime.h>
+#import <math.h>
 
 /*
  * YCYUnlock v1.8.9
@@ -37,7 +38,7 @@ static NSString * const kYCYLockNameKey = @"YCYUnlock.lastLockName";
 static NSString * const kYCYHelloKey = @"YCYUnlock.helloHex";
 static NSString * const kYCYHelloCharKey = @"YCYUnlock.helloChar";
 static NSString * const kYCYBtStateKey = @"YCYUnlock.btState";
-static NSString * const kYCYVersion = @"1.9.0";
+static NSString * const kYCYVersion = @"2.1.0";
 
 static const NSInteger kYCYHandshakeWrites = 5;
 static const NSTimeInterval kYCYHandshakeSeconds = 8.0;
@@ -2037,6 +2038,391 @@ static BOOL YCYTryJSBridge(void) {
     return ok;
 }
 
+#pragma mark - 隐藏时间（hide_time / counts / ls_counts）
+
+/*
+ * 役次元的「被隐藏的时间」= play 记录上的 hide_time 开关：
+ *   主人（控方）在 游戏配置 → 隐藏剩余时间 打开后，服务端把记录标成 hide_time=1，
+ *   m 端看到的是「已隐藏时间且不可查看~」，卡片不再渲染 u-count-down。
+ *   记录里真正决定倒计时的是 counts（剩余秒数，u-count-down :time="1000*item.counts"），
+ *   总时长 all_times、已用 has_times、进度 rate、救赎之锁剩余 ls_counts 同族。
+ *   付费入口是 play/see_time（is_see 权限 + see_rate 倍惩罚，显示 5 分钟）。
+ *
+ * 本模块做三件事：
+ *   1) 在 App 自己的 service JSContext 里把当前页 / 列表里所有 play 记录的
+ *      hide_time→0、vips.js.is→0（只改内存，不动服务端），
+ *      于是 App 自己就会把 u-count-down 和「剩余时间」渲染出来；
+ *      is_see 故意不动：保持 0 就不会出现「查看时间」这类付费按钮。
+ *   2) 如果服务端确实把 counts 抹成 0/不下发，就用 play/show 的
+ *      all_times/has_times/rate 反推，再退化到 play/keys_cut（is_read:1）
+ *      这台接口泄漏的 r.counts；三条路都拿不到时显示 --:--。
+ *   3) 免惩罚：包住页面 $http.post，命中 play/see_time 直接返回 {code:0} 不联网，
+ *      即使误点「查看时间 → 确认」也不会把 see_rate×剩余 的惩罚发出去；
+ *      其它端点（play/show、play/keys_cut(is_read)、play/add_time…）原样透传。
+ *
+ * 结果通过 g.__ycy_t.out 缓存，原生端每秒读一次、每 5 秒完整同步一次，
+ * 悬浮窗下面的小标签就是实际剩余时间（不依赖 App 页面是否重绘）。
+ */
+
+// @@REVEAL_JS_BEGIN@@
+static NSString * const kYCYJSRevealSync =
+    @"(function (g) {\n"
+    @"  try {\n"
+    @"    var T = (g.__ycy_t = g.__ycy_t || {});\n"
+    @"    function now() { return Math.floor(Date.now() / 1000); }\n"
+    @"    function isRec(o) {\n"
+    @"      return o && typeof o === 'object' && o.id != null &&\n"
+    @"        (o.hide_time != null || o.counts != null || o.ls_counts != null ||\n"
+    @"         o.all_times != null || o.has_times != null);\n"
+    @"    }\n"
+    @"    function sv(vm, o, k, v) {\n"
+    @"      try { if (vm && vm.$set) vm.$set(o, k, v); else o[k] = v; }\n"
+    @"      catch (e) { try { o[k] = v; } catch (e2) {} }\n"
+    @"    }\n"
+    @"    // 免惩罚：把 play/see_time 在网络层直接吃掉（加 see_rate×剩余 的惩罚请求永不发出）。\n"
+    @"    // 只拦这一个端点，其余请求原样透传，play/show、play/keys_cut(is_read) 都不受影响。\n"
+    @"    function guardHttp(vm) {\n"
+    @"      try {\n"
+    @"        var h = vm && vm.$http;\n"
+    @"        if (!h || h.__ycy_guard || typeof h.post !== 'function') return;\n"
+    @"        var op = h.post;\n"
+    @"        h.__ycy_guard = 1;\n"
+    @"        h.post = function (u, d) {\n"
+    @"          try {\n"
+    @"            if (typeof u === 'string' && u.indexOf('play/see_time') >= 0) {\n"
+    @"              T.blocked = (T.blocked || 0) + 1;\n"
+    @"              return Promise.resolve({ code: 0, msg: 'ycy:no-penalty' });\n"
+    @"            }\n"
+    @"          } catch (e) {}\n"
+    @"          return op.apply(this, arguments);\n"
+    @"        };\n"
+    @"      } catch (e) {}\n"
+    @"    }\n"
+    @"    var AP = ['counts', 'all_times', 'has_times', 'add_times', 'cut_times',\n"
+    @"              'rate', 'ls_counts', 'max_times', 'is_js', 'is_ls_open'];\n"
+    @"\n"
+    @"    var pg = (typeof getCurrentPages === 'function') ? getCurrentPages() : [];\n"
+    @"    var recs = [], best = null, host = null;\n"
+    @"    for (var i = 0; i < pg.length; i++) {\n"
+    @"      var vm = pg[i] && (pg[i].$vm || pg[i]);\n"
+    @"      if (!vm) continue;\n"
+    @"      if (!host && vm.$http && vm.$http.post) host = vm;\n"
+    @"      guardHttp(vm);\n"
+    @"      var cand = [];\n"
+    @"      try { if (vm.r) cand.push(vm.r); } catch (e) {}\n"
+    @"      try { if (vm.item) cand.push(vm.item); } catch (e) {}\n"
+    @"      try { if (vm.info) cand.push(vm.info); } catch (e) {}\n"
+    @"      try { if (vm.datas && vm.datas.data && vm.datas.data.length) cand = cand.concat(vm.datas.data); } catch (e) {}\n"
+    @"      try { if (vm.list && vm.list.length) cand = cand.concat(vm.list); } catch (e) {}\n"
+    @"      for (var j = 0; j < cand.length && j < 120; j++) {\n"
+    @"        var o = cand[j];\n"
+    @"        if (!isRec(o)) continue;\n"
+    @"        // 1) 关掉「隐藏」：hide_time=0 后卡片整块「已隐藏时间/查看时间」不再渲染\n"
+    @"        try { if (o.hide_time) sv(vm, o, 'hide_time', 0); } catch (e) {}\n"
+    @"        // 2) 关掉「时间枷锁」分支，让 show_type 走 1（倒计时卡）；\n"
+    @"        //    不再把 is_see 置 1 —— 避免把「可查看」态打开、「查看时间」按钮冒出来\n"
+    @"        try { if (o.vips && o.vips.js && o.vips.js.is) sv(vm, o.vips.js, 'is', 0); } catch (e) {}\n"
+    @"        recs.push(o);\n"
+    @"        if (!best || (o.counts || 0) > (best.counts || 0)) best = o;\n"
+    @"      }\n"
+    @"    }\n"
+    @"    if (!host) {\n"
+    @"      for (var k = pg.length - 1; k >= 0; k--) {\n"
+    @"        var v2 = pg[k] && (pg[k].$vm || pg[k]);\n"
+    @"        if (v2 && v2.$http && v2.$http.post) { host = v2; break; }\n"
+    @"      }\n"
+    @"    }\n"
+    @"\n"
+    @"    var out = { ok: 0, n: recs.length, id: 0, counts: 0, ls: 0, all: 0, used: 0,\n"
+    @"                rate: 0, add: 0, cut: 0, blocked: (T.blocked || 0), src: '-' };\n"
+    @"    if (best) {\n"
+    @"      out.ok = 1;\n"
+    @"      out.id = best.id;\n"
+    @"      out.counts = best.counts || 0;\n"
+    @"      out.ls = best.ls_counts || 0;\n"
+    @"      out.all = best.all_times || 0;\n"
+    @"      out.used = best.has_times || 0;\n"
+    @"      out.rate = best.rate || 0;\n"
+    @"      out.add = best.add_times || 0;\n"
+    @"      out.cut = best.cut_times || 0;\n"
+    @"      out.src = 'ui';\n"
+    @"    }\n"
+    @"\n"
+    @"    var id = out.id || T.lastId || 0;\n"
+    @"    if (!out.counts && id && host && ((T.lastId !== id) || !T.busy || now() - T.busy > 4)) {\n"
+    @"      T.busy = now();\n"
+    @"      try {\n"
+    @"        host.$http.post('play/show', { id: id, append: AP }).then(function (r) {\n"
+    @"          try {\n"
+    @"            var d = r && r.data;\n"
+    @"            if (r && r.code && d) {\n"
+    @"              var c = d.counts || 0;\n"
+    @"              if (!c && d.all_times != null && d.has_times != null) {\n"
+    @"                c = Math.max(0, (d.all_times || 0) - (d.has_times || 0));\n"
+    @"              }\n"
+    @"              T.srv = { id: id, counts: c, ls: d.ls_counts || 0, all: d.all_times || 0,\n"
+    @"                        used: d.has_times || 0, rate: d.rate || 0, src: 'show', t: now() };\n"
+    @"              T.lastId = id;\n"
+    @"              try { if (best) sv(host, best, 'counts', c); } catch (e) {}\n"
+    @"            } else {\n"
+    @"              host.$http.post('play/keys_cut', { id: id, is_read: 1 }).then(function (r2) {\n"
+    @"                try {\n"
+    @"                  var x = r2 && r2.data && r2.data.r;\n"
+    @"                  if (r2 && r2.code && x) {\n"
+    @"                    T.srv = { id: id, counts: x.counts || 0, ls: x.ls_counts || 0,\n"
+    @"                              all: x.all_times || 0, used: x.has_times || 0,\n"
+    @"                              rate: x.rate || 0, src: 'keys_cut', t: now() };\n"
+    @"                    T.lastId = id;\n"
+    @"                    try { if (best) sv(host, best, 'counts', x.counts || 0); } catch (e) {}\n"
+    @"                  }\n"
+    @"                } catch (e) {}\n"
+    @"              });\n"
+    @"            }\n"
+    @"          } catch (e) {}\n"
+    @"        });\n"
+    @"      } catch (e) {}\n"
+    @"    }\n"
+    @"\n"
+    @"    var s = T.srv;\n"
+    @"    if (s && !out.counts && s.counts > 0 && (now() - (s.t || 0)) < 60) {\n"
+    @"      out.ok = 1;\n"
+    @"      out.id = out.id || s.id;\n"
+    @"      out.counts = s.counts;\n"
+    @"      out.ls = out.ls || s.ls;\n"
+    @"      out.all = out.all || s.all;\n"
+    @"      out.used = out.used || s.used;\n"
+    @"      out.rate = out.rate || s.rate;\n"
+    @"      out.src = (out.src === '-' ? '' : out.src + '+') + s.src;\n"
+    @"    }\n"
+    @"    if (!out.counts && out.all > 0) {\n"
+    @"      var rest = out.all - (out.used || 0) + (out.add || 0) - (out.cut || 0);\n"
+    @"      if (rest < 0) rest = 0;\n"
+    @"      out.counts = rest;\n"
+    @"      out.src += '+calc';\n"
+    @"    }\n"
+    @"    out.blocked = (T.blocked || 0);\n"
+    @"    out.t = now();\n"
+    @"    T.out = out;\n"
+    @"    return JSON.stringify(out);\n"
+    @"  } catch (e) {\n"
+    @"    return '{\"ok\":0,\"err\":\"' + String(e).slice(0, 80) + '\"}';\n"
+    @"  }\n"
+    @"})(this)\n"
+    @"";
+
+static NSString * const kYCYJSRevealRead =
+    @"(function (g) {\n"
+    @"  try {\n"
+    @"    var T = g.__ycy_t;\n"
+    @"    if (!T || !T.out) return '{\"ok\":0}';\n"
+    @"    return JSON.stringify(T.out);\n"
+    @"  } catch (e) {\n"
+    @"    return '{\"ok\":0}';\n"
+    @"  }\n"
+    @"})(this)\n"
+    @"";
+// @@REVEAL_JS_END@@
+
+static BOOL gRevealOn = NO;
+static UILabel *revealLabel = nil;
+static CFAbsoluteTime gRevealDeadline = 0;
+static NSInteger gRevealLs = 0;
+static NSInteger gRevealAll = 0;
+static NSInteger gRevealUsed = 0;
+static NSInteger gRevealRate = 0;
+static NSInteger gRevealPlayId = 0;
+static NSInteger gRevealBlocked = 0;   // 被拦掉的 play/see_time 次数（免惩罚）
+static NSUInteger gRevealTick = 0;
+static BOOL gRevealTicking = NO;
+static NSString *gRevealSrc = @"-";
+
+static void YCYRevealLayoutLabel(void) {
+    if (!revealLabel || !floatButton) return;
+    CGRect b = floatButton.frame;
+    CGFloat w = 160, h = 30;
+    CGFloat x = b.origin.x + (b.size.width - w) / 2.0;
+    CGFloat maxX = floatButton.superview.bounds.size.width - w - 8;
+    if (x > maxX) x = maxX;
+    if (x < 8) x = 8;
+    revealLabel.frame = CGRectMake(x, CGRectGetMaxY(b) + 6, w, h);
+}
+
+static NSString *YCYFormatClock(NSInteger sec) {
+    if (sec < 0) sec = 0;
+    NSInteger h = sec / 3600;
+    NSInteger m = (sec % 3600) / 60;
+    NSInteger s = sec % 60;
+    if (h > 0) return [NSString stringWithFormat:@"%02ld:%02ld:%02ld", (long)h, (long)m, (long)s];
+    return [NSString stringWithFormat:@"%02ld:%02ld", (long)m, (long)s];
+}
+
+// 在所有已知 JSContext 上跑一段脚本，取回 JSON 字典（多为 empty 时返回 nil）。
+static NSDictionary *YCYEvalJSJSON(NSString *script, NSString *tag) {
+    NSArray *ctxs;
+    @synchronized (jsContexts) {
+        ctxs = [[jsContexts allObjects] copy];
+    }
+    if (ctxs.count == 0) {
+        YCYLog(@"无 JSContext，跳过 %@", tag);
+        return nil;
+    }
+    NSDictionary *best = nil;
+    gInJSProbe = YES;
+    for (JSContext *ctx in ctxs) {
+        @try {
+            JSValue *v = [ctx evaluateScript:script];
+            NSString *s = v.isString ? v.toString : nil;
+            if (s.length == 0) continue;
+            NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
+            id obj = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+            if (![obj isKindOfClass:[NSDictionary class]]) {
+                YCYLog(@"%@ 非 JSON: %.160@", tag, s);
+                continue;
+            }
+            NSDictionary *dict = (NSDictionary *)obj;
+            id cv = dict[@"counts"];
+            NSInteger c = [cv isKindOfClass:[NSNumber class]] ? [cv integerValue] : 0;
+            if (!best || c > [best[@"counts"] integerValue]) best = dict;
+        } @catch (NSException *ex) {
+            YCYLog(@"%@ 异常: %@", tag, ex.reason);
+        }
+    }
+    gInJSProbe = NO;
+    return best;
+}
+
+static NSInteger YCYJSONInt(NSDictionary *dict, NSString *key) {
+    id v = dict[key];
+    if ([v isKindOfClass:[NSNumber class]] || [v isKindOfClass:[NSString class]]) {
+        return [v integerValue];
+    }
+    return 0;
+}
+
+static void YCYRevealApply(NSDictionary *dict) {
+    if (![dict isKindOfClass:[NSDictionary class]]) return;
+    NSInteger counts = YCYJSONInt(dict, @"counts");
+    gRevealLs   = YCYJSONInt(dict, @"ls");
+    gRevealAll  = YCYJSONInt(dict, @"all");
+    gRevealUsed = YCYJSONInt(dict, @"used");
+    gRevealRate = YCYJSONInt(dict, @"rate");
+    gRevealPlayId = YCYJSONInt(dict, @"id");
+    gRevealBlocked = YCYJSONInt(dict, @"blocked");
+    gRevealSrc = [dict[@"src"] isKindOfClass:[NSString class]] ? dict[@"src"] : @"-";
+    if (counts > 0) {
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        NSInteger left = (NSInteger)llround(gRevealDeadline - now);
+        // 偏差超过 2 秒才重设，避免每秒抖动
+        if (gRevealDeadline <= 0 || labs((long)(left - counts)) > 2) {
+            gRevealDeadline = now + counts;
+        }
+    }
+}
+
+static void YCYRevealUpdateLabel(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!revealLabel) return;
+        if (!gRevealOn) { revealLabel.hidden = YES; return; }
+        revealLabel.hidden = NO;
+        YCYRevealLayoutLabel();
+        NSInteger left = 0;
+        if (gRevealDeadline > 0) {
+            left = (NSInteger)llround(gRevealDeadline - CFAbsoluteTimeGetCurrent());
+            if (left < 0) left = 0;
+        }
+        if (left > 0) {
+            revealLabel.text = [NSString stringWithFormat:@"剩余 %@", YCYFormatClock(left)];
+            revealLabel.textColor = [UIColor whiteColor];
+        } else if (gRevealLs > 0) {
+            revealLabel.text = [NSString stringWithFormat:@"锁 %@", YCYFormatClock(gRevealLs)];
+            revealLabel.textColor = [UIColor systemYellowColor];
+        } else {
+            revealLabel.text = @"剩余 --:--";
+            revealLabel.textColor = [UIColor lightGrayColor];
+        }
+    });
+}
+
+static void YCYRevealTickSchedule(void);
+
+static void YCYRevealTick(void) {
+    if (!gRevealOn) { gRevealTicking = NO; return; }
+    gRevealTick++;
+    NSDictionary *dict = nil;
+    // 第 1 拍和每 5 拍做一次完整同步（打 hide_time 补丁 + 拉服务端），其余只读缓存
+    if (gRevealTick % 5 == 1) {
+        dict = YCYEvalJSJSON(kYCYJSRevealSync, @"JS time-sync");
+    } else {
+        dict = YCYEvalJSJSON(kYCYJSRevealRead, @"JS time-read");
+    }
+    if (dict) YCYRevealApply(dict);
+    YCYRevealUpdateLabel();
+    YCYRevealTickSchedule();
+}
+
+static void YCYRevealTickSchedule(void) {
+    if (!gRevealOn) { gRevealTicking = NO; return; }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ YCYRevealTick(); });
+}
+
+static void YCYRevealSetOn(BOOL on) {
+    gRevealOn = on;
+    if (!on) {
+        gRevealDeadline = 0;
+        YCYRevealUpdateLabel();
+        YCYShowToast(@"已关闭隐藏时间显示");
+        return;
+    }
+    gRevealTick = 0;
+    NSDictionary *dict = YCYEvalJSJSON(kYCYJSRevealSync, @"JS time-sync");
+    if (dict) YCYRevealApply(dict);
+    YCYRevealUpdateLabel();
+    if (!gRevealTicking) {
+        gRevealTicking = YES;
+        YCYRevealTickSchedule();
+    }
+    if (gRevealDeadline > 0) {
+        YCYShowToast([NSString stringWithFormat:@"已显示隐藏时间：%@", YCYFormatClock((NSInteger)llround(gRevealDeadline - CFAbsoluteTimeGetCurrent()))]);
+    } else {
+        YCYShowToast(@"没读到 counts\n请先进游戏页再开");
+    }
+}
+
+static void YCYRevealSyncOnce(void) {
+    NSDictionary *dict = YCYEvalJSJSON(kYCYJSRevealSync, @"JS time-sync");
+    if (!dict) {
+        YCYShowToast(@"没有 JSContext：请先打开 App 的游戏页");
+        return;
+    }
+    YCYRevealApply(dict);
+    YCYRevealUpdateLabel();
+    NSInteger left = 0;
+    if (gRevealDeadline > 0) left = (NSInteger)llround(gRevealDeadline - CFAbsoluteTimeGetCurrent());
+    YCYLog(@"time-sync id=%ld counts=%ld ls=%ld all=%ld used=%ld rate=%ld src=%@ n=%@ blocked=%ld",
+           (long)gRevealPlayId, (long)left, (long)gRevealLs, (long)gRevealAll,
+           (long)gRevealUsed, (long)gRevealRate, gRevealSrc, dict[@"n"],
+           (long)gRevealBlocked);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *a =
+            [UIAlertController alertControllerWithTitle:@"隐藏时间（诊断）"
+                                                message:[NSString stringWithFormat:
+                    @"记录 id：%ld\n剩余：%@\n救赎之锁：%@\n总时长：%@\n已用：%@\n进度：%ld%%\n取值来源：%@\n扫描记录数：%@\n拦截 see_time：%ld 次（免惩罚）",
+                    (long)gRevealPlayId,
+                    YCYFormatClock(left),
+                    YCYFormatClock(gRevealLs),
+                    YCYFormatClock(gRevealAll),
+                    YCYFormatClock(gRevealUsed),
+                    (long)gRevealRate,
+                    gRevealSrc,
+                    (dict[@"n"] ?: @"?"),
+                    (long)gRevealBlocked]
+                                         preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+        [YCYTopVC() presentViewController:a animated:YES completion:nil];
+    });
+}
+
 static __attribute__((unused)) BOOL YCYTryJSConnect(void) {
     NSString *uuid = lastLockUUID.UUIDString ?: @"";
     if (uuid.length == 0) {
@@ -2832,6 +3218,18 @@ static void YCYShowMenu(UIButton *sender) {
                                                     YCYShowToast(@"没找到 _ble_do，请看日志里的 JS probe / trap");
                                                 }
                                             }]];
+    [menu addAction:[UIAlertAction actionWithTitle:(gRevealOn ? @"关闭「显示隐藏时间」" : @"显示隐藏时间（hide_time）")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+                                                (void)a;
+                                                YCYRevealSetOn(!gRevealOn);
+                                            }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"隐藏时间：立即同步 / 诊断"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+                                                (void)a;
+                                                YCYRevealSyncOnce();
+                                            }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"查看已记录指令"
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
@@ -2914,6 +3312,7 @@ static void YCYShowMenu(UIButton *sender) {
     if (CGRectGetMaxX(f) > b.size.width) f.origin.x = b.size.width - f.size.width;
     if (CGRectGetMaxY(f) > b.size.height - 40) f.origin.y = b.size.height - f.size.height - 40;
     v.frame = f;
+    YCYRevealLayoutLabel();
 }
 
 - (void)observeValueForKeyPath:(NSString *)keyPath
@@ -2997,6 +3396,20 @@ static void YCYCreateFloatingButton(void) {
         [floatButton addGestureRecognizer:lp];
 
         [vc.view addSubview:floatButton];
+
+        revealLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 160, 30)];
+        revealLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.72];
+        revealLabel.textColor = [UIColor whiteColor];
+        revealLabel.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightSemibold];
+        revealLabel.textAlignment = NSTextAlignmentCenter;
+        revealLabel.layer.cornerRadius = 8;
+        revealLabel.layer.masksToBounds = YES;
+        revealLabel.text = @"剩余 --:--";
+        revealLabel.hidden = !gRevealOn;
+        revealLabel.userInteractionEnabled = NO;
+        [vc.view addSubview:revealLabel];
+        YCYRevealLayoutLabel();
+
         floatWindow.rootViewController = vc;
         floatWindow.hidden = NO;
         YCYLog(@"Floating unlock button created");
