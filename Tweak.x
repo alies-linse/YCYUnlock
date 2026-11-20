@@ -60,6 +60,20 @@ static BOOL gUnlockInFlight = NO;
 static BOOL gCanonicalFrozen = NO;
 static BOOL gNeedsRediscover = NO;
 static BOOL gInJSProbe = NO;
+static dispatch_queue_t gLogFileQueue = nil;
+static dispatch_queue_t gJSWorkQueue = nil;
+static NSUInteger gToastGen = 0;
+static BOOL gRevealSyncInFlight = NO;
+
+static BOOL YCYIsInJSProbe(void) {
+    NSNumber *flag = [NSThread currentThread].threadDictionary[@"YCYInJSProbe"];
+    return flag ? flag.boolValue : gInJSProbe;
+}
+
+static void YCYSetInJSProbe(BOOL val) {
+    [NSThread currentThread].threadDictionary[@"YCYInJSProbe"] = @(val);
+    if ([NSThread isMainThread]) gInJSProbe = val;
+}
 static BOOL gDumpedClasses = NO;
 static BOOL gDumpedDCBLE = NO;
 static BOOL gCaptureArmed = NO;
@@ -159,6 +173,10 @@ static void YCYInitState(void) {
         gDCBLEOpenSels = [NSMutableArray array];
         gDCBLEConnectSels = [NSMutableArray array];
         gJSContextTraps = [NSMutableSet set];
+        gLogFileQueue = dispatch_queue_create("com.ycy.unlock.logfile",
+                                              dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+        gJSWorkQueue = dispatch_queue_create("com.ycy.unlock.jswork",
+                                             dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
         YCYLoadRecords();
         NSLog(@"[YCYUnlock] State initialized v%@ frozen=%d records=%lu",
               kYCYVersion, gCanonicalFrozen, (unsigned long)canonicalWrites.count);
@@ -191,19 +209,35 @@ static void YCYLog(NSString *format, ...) {
     if (bleLogs.count > 800) {
         [bleLogs removeObjectsInRange:NSMakeRange(0, bleLogs.count - 800)];
     }
-    // 持久化到文件：App 卡死被强杀后，重启仍能取回完整日志。
-    @autoreleasepool {
-        NSString *withNewline = [line stringByAppendingString:@"\n"];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:YCYLogFilePath()];
-        if (fh) {
-            [fh seekToEndOfFile];
-            [fh writeData:[withNewline dataUsingEncoding:NSUTF8StringEncoding]];
-            [fh closeFile];
-        } else {
-            [withNewline writeToFile:YCYLogFilePath() atomically:NO encoding:NSUTF8StringEncoding error:nil];
-        }
-    }
     [bleLogLock unlock];
+
+    // 异步持久化到文件（避免主线程/BLE 回调同步写盘卡顿），并限制最大体积为 512KB。
+    if (gLogFileQueue) {
+        NSString *logLine = [line stringByAppendingString:@"\n"];
+        dispatch_async(gLogFileQueue, ^{
+            @autoreleasepool {
+                NSString *path = YCYLogFilePath();
+                NSFileManager *fm = [NSFileManager defaultManager];
+                NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
+                unsigned long long fileSize = [attrs fileSize];
+                if (fileSize > 512 * 1024) {
+                    NSData *existing = [NSData dataWithContentsOfFile:path];
+                    if (existing.length > 256 * 1024) {
+                        NSData *tail = [existing subdataWithRange:NSMakeRange(existing.length - 256 * 1024, 256 * 1024)];
+                        [tail writeToFile:path atomically:YES];
+                    }
+                }
+                NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+                if (fh) {
+                    [fh seekToEndOfFile];
+                    [fh writeData:[logLine dataUsingEncoding:NSUTF8StringEncoding]];
+                    [fh closeFile];
+                } else {
+                    [logLine writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
+                }
+            }
+        });
+    }
 }
 
 static NSString *YCYHexString(NSData *data) {
@@ -970,8 +1004,16 @@ static void YCYRememberPeripheral(CBPeripheral *peripheral) {
         lastLockUUID = peripheral.identifier;
         lastLockName = YCYPeripheralName(peripheral);
     }
-    if (key.length && ![observedPeripheralIDs containsObject:key]) {
-        [observedPeripheralIDs addObject:key];
+    BOOL shouldObserve = NO;
+    if (key.length) {
+        [peripheralLock lock];
+        if (![observedPeripheralIDs containsObject:key]) {
+            [observedPeripheralIDs addObject:key];
+            shouldObserve = YES;
+        }
+        [peripheralLock unlock];
+    }
+    if (shouldObserve) {
         @try {
             [peripheral addObserver:[YCYUnlockHelper shared]
                          forKeyPath:@"state"
@@ -1069,8 +1111,7 @@ static BOOL YCYIsFrozenPayload(NSData *data) {
 
 #pragma mark - Toast / 弹窗
 
-static UIWindow *YCYHostWindow(void) {
-    if (floatWindow && !floatWindow.hidden) return floatWindow;
+static UIWindow *YCYAppKeyWindow(void) {
     UIApplication *application = [UIApplication sharedApplication];
     if (@available(iOS 13.0, *)) {
         for (UIScene *scene in application.connectedScenes) {
@@ -1078,21 +1119,88 @@ static UIWindow *YCYHostWindow(void) {
             if (![scene isKindOfClass:[UIWindowScene class]]) continue;
             UIWindowScene *windowScene = (UIWindowScene *)scene;
             for (UIWindow *window in windowScene.windows) {
-                if (window.isKeyWindow && !window.hidden) return window;
+                if (window == floatWindow) continue;
+                if (window.isKeyWindow && !window.hidden && window.rootViewController) return window;
             }
             for (UIWindow *window in windowScene.windows) {
-                if (!window.hidden) return window;
+                if (window == floatWindow) continue;
+                if (!window.hidden && window.rootViewController) return window;
             }
         }
     }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    for (UIWindow *window in application.windows) {
+        if (window != floatWindow && !window.hidden && window.rootViewController) return window;
+    }
+#pragma clang diagnostic pop
     return nil;
 }
 
+static UIWindow *YCYHostWindow(void) {
+    if (floatWindow && !floatWindow.hidden) return floatWindow;
+    return YCYAppKeyWindow();
+}
+
 static UIViewController *YCYTopVC(void) {
-    UIWindow *window = YCYHostWindow();
+    // 弹窗优先挂载到宿主 App 的窗口，避免高 windowLevel 的 floatWindow 残余 UITransitionView 拦截全屏触摸
+    UIWindow *window = YCYAppKeyWindow() ?: YCYHostWindow();
     UIViewController *vc = window.rootViewController;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
+    while (vc) {
+        if (vc.presentedViewController && !vc.presentedViewController.isBeingDismissed) {
+            vc = vc.presentedViewController;
+        } else if ([vc isKindOfClass:[UINavigationController class]]) {
+            UIViewController *top = ((UINavigationController *)vc).topViewController;
+            if (!top || top == vc) break;
+            vc = top;
+        } else if ([vc isKindOfClass:[UITabBarController class]]) {
+            UIViewController *sel = ((UITabBarController *)vc).selectedViewController;
+            if (!sel || sel == vc) break;
+            vc = sel;
+        } else {
+            break;
+        }
+    }
     return vc;
+}
+
+static void YCYSafePresentVC(UIViewController *vcToPresent, int retryCount) {
+    if (!vcToPresent) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *presenter = YCYTopVC();
+        if (!presenter || !presenter.view.window) {
+            if (retryCount < 3) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    YCYSafePresentVC(vcToPresent, retryCount + 1);
+                });
+            }
+            return;
+        }
+        // 若当前顶层控制器仍在转场（例如 ActionSheet 正在关闭）或本身就是旧的 Alert，等待或先关闭再弹出
+        if (presenter.isBeingDismissed || presenter.isBeingPresented ||
+            (presenter.presentedViewController && presenter.presentedViewController.isBeingDismissed)) {
+            if (retryCount < 6) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    YCYSafePresentVC(vcToPresent, retryCount + 1);
+                });
+            }
+            return;
+        }
+        if ([presenter isKindOfClass:[UIAlertController class]]) {
+            UIViewController *parent = presenter.presentingViewController;
+            [presenter dismissViewControllerAnimated:NO completion:^{
+                if (parent && parent.view.window) {
+                    [parent presentViewController:vcToPresent animated:YES completion:nil];
+                } else {
+                    YCYSafePresentVC(vcToPresent, retryCount + 1);
+                }
+            }];
+            return;
+        }
+        [presenter presentViewController:vcToPresent animated:YES completion:nil];
+    });
 }
 
 static void YCYShowToast(NSString *text) {
@@ -1111,7 +1219,10 @@ static void YCYShowToast(NSString *text) {
             toastLabel.numberOfLines = 0;
             toastLabel.layer.cornerRadius = 10;
             toastLabel.layer.masksToBounds = YES;
+            toastLabel.userInteractionEnabled = NO;
         }
+        gToastGen++;
+        NSUInteger myGen = gToastGen;
         toastLabel.text = [NSString stringWithFormat:@"  %@  ", text];
         [toastLabel sizeToFit];
         CGFloat w = MIN(window.bounds.size.width - 40, MAX(180, toastLabel.bounds.size.width + 24));
@@ -1123,11 +1234,14 @@ static void YCYShowToast(NSString *text) {
         [UIView animateWithDuration:0.2 animations:^{ toastLabel.alpha = 1; }];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.4 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
+            if (gToastGen != myGen) return;
             [UIView animateWithDuration:0.25 animations:^{
                 toastLabel.alpha = 0;
             } completion:^(BOOL finished) {
                 (void)finished;
-                [toastLabel removeFromSuperview];
+                if (gToastGen == myGen) {
+                    [toastLabel removeFromSuperview];
+                }
             }];
         });
     });
@@ -1695,12 +1809,17 @@ static NSString * const kYCYJSTrapScript =
     "function trap(name){"
     "try{"
     "var store='__ycy_'+name;"
+    "var wm=(typeof WeakMap==='function')?new WeakMap():null;"
     "Object.defineProperty(Object.prototype,name,{"
     "configurable:true,enumerable:false,"
+    "get:function(){return wm?wm.get(this):undefined;},"
     "set:function(v){"
     "try{g[store]=v;}catch(e){}"
-    "try{Object.defineProperty(this,name,{value:v,writable:true,configurable:true,enumerable:true});}"
-    "catch(e){}"
+    "try{"
+    "if(this&&Object.isExtensible(this)){"
+    "Object.defineProperty(this,name,{value:v,writable:true,configurable:true,enumerable:true});"
+    "}else if(wm&&this&&typeof this==='object'){wm.set(this,v);}"
+    "}catch(e){}"
     "}"
     "});"
     "}catch(e){return String(e);}"
@@ -1871,24 +1990,25 @@ static void YCYInstallJSTrap(JSContext *ctx) {
     @synchronized (jsContexts) {
         [jsContexts addObject:ctx];
     }
-    BOOL old = gInJSProbe;
-    gInJSProbe = YES;
+    BOOL old = YCYIsInJSProbe();
+    YCYSetInJSProbe(YES);
     @try {
         JSValue *v = [ctx evaluateScript:kYCYJSTrapScript];
         YCYLog(@"JS trap %@", v.isString ? v.toString : @"?");
     } @catch (NSException *ex) {
         YCYLog(@"JS trap 异常: %@", ex.reason);
     }
-    gInJSProbe = old;
+    YCYSetInJSProbe(old);
 }
 
 static void YCYRememberJSContext(JSContext *ctx) {
-    if (!ctx || gInJSProbe) return;
+    if (!ctx || YCYIsInJSProbe()) return;
     YCYInstallJSTrap(ctx);
     static BOOL probed = NO;
     if (probed) return;
     probed = YES;
-    gInJSProbe = YES;
+    BOOL old = YCYIsInJSProbe();
+    YCYSetInJSProbe(YES);
     @try {
         JSValue *v = [ctx evaluateScript:
             @"(function(){var a=[];function w(o,p,d){if(!o||d>3)return;try{var ks=Object.keys(o);for(var i=0;i<ks.length&&i<60;i++){var k=ks[i];if(/ble|open|lock|unlock|jm|ys0|dcble/i.test(k))a.push(p+k);var v=o[k];if(v&&typeof v==='object')w(v,p+k+'.',d+1);}}catch(e){}}"
@@ -1904,7 +2024,7 @@ static void YCYRememberJSContext(JSContext *ctx) {
     } @catch (NSException *ex) {
         YCYLog(@"JS probe 异常: %@", ex.reason);
     }
-    gInJSProbe = NO;
+    YCYSetInJSProbe(old);
 }
 
 static BOOL YCYTryJSOpen(void) {
@@ -1916,7 +2036,8 @@ static BOOL YCYTryJSOpen(void) {
         YCYLog(@"无 JSContext，跳过 App 内部开锁");
         return NO;
     }
-    gInJSProbe = YES;
+    BOOL oldProbe = YCYIsInJSProbe();
+    YCYSetInJSProbe(YES);
     BOOL opened = NO;
     for (JSContext *ctx in ctxs) {
         @try {
@@ -1928,7 +2049,7 @@ static BOOL YCYTryJSOpen(void) {
             YCYLog(@"JS open 异常: %@", ex.reason);
         }
     }
-    gInJSProbe = NO;
+    YCYSetInJSProbe(oldProbe);
     return opened;
 }
 
@@ -1941,7 +2062,8 @@ static __attribute__((unused)) BOOL YCYTryJSToken(void) {
         YCYLog(@"无 JSContext，跳过 token 请求");
         return NO;
     }
-    gInJSProbe = YES;
+    BOOL oldProbe = YCYIsInJSProbe();
+    YCYSetInJSProbe(YES);
     BOOL ok = NO;
     for (JSContext *ctx in ctxs) {
         @try {
@@ -1953,7 +2075,7 @@ static __attribute__((unused)) BOOL YCYTryJSToken(void) {
             YCYLog(@"JS token 异常: %@", ex.reason);
         }
     }
-    gInJSProbe = NO;
+    YCYSetInJSProbe(oldProbe);
     return ok;
 }
 
@@ -1966,7 +2088,8 @@ static BOOL YCYEvalJSAll(NSString *script, NSString *tag, NSString *successPrefi
         YCYLog(@"无 JSContext，跳过 %@", tag);
         return NO;
     }
-    gInJSProbe = YES;
+    BOOL oldProbe = YCYIsInJSProbe();
+    YCYSetInJSProbe(YES);
     BOOL ok = NO;
     for (JSContext *ctx in ctxs) {
         @try {
@@ -1979,7 +2102,7 @@ static BOOL YCYEvalJSAll(NSString *script, NSString *tag, NSString *successPrefi
             YCYLog(@"%@ 异常: %@", tag, ex.reason);
         }
     }
-    gInJSProbe = NO;
+    YCYSetInJSProbe(oldProbe);
     return ok;
 }
 
@@ -2013,7 +2136,8 @@ static BOOL YCYTryJSBridge(void) {
         YCYLog(@"无 JSContext，跳过 bridge");
         return NO;
     }
-    gInJSProbe = YES;
+    BOOL oldProbe = YCYIsInJSProbe();
+    YCYSetInJSProbe(YES);
     BOOL ok = NO;
     for (JSContext *ctx in ctxs) {
         @try {
@@ -2034,7 +2158,7 @@ static BOOL YCYTryJSBridge(void) {
             YCYLog(@"JS bridge 异常: %@", ex.reason);
         }
     }
-    gInJSProbe = NO;
+    YCYSetInJSProbe(oldProbe);
     return ok;
 }
 
@@ -2267,7 +2391,8 @@ static NSDictionary *YCYEvalJSJSON(NSString *script, NSString *tag) {
         return nil;
     }
     NSDictionary *best = nil;
-    gInJSProbe = YES;
+    BOOL old = YCYIsInJSProbe();
+    YCYSetInJSProbe(YES);
     for (JSContext *ctx in ctxs) {
         @try {
             JSValue *v = [ctx evaluateScript:script];
@@ -2287,8 +2412,20 @@ static NSDictionary *YCYEvalJSJSON(NSString *script, NSString *tag) {
             YCYLog(@"%@ 异常: %@", tag, ex.reason);
         }
     }
-    gInJSProbe = NO;
+    YCYSetInJSProbe(old);
     return best;
+}
+
+static void YCYEvalJSJSONAsync(NSString *script, NSString *tag, void (^completion)(NSDictionary *dict)) {
+    dispatch_queue_t q = gJSWorkQueue ?: dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_async(q, ^{
+        NSDictionary *dict = YCYEvalJSJSON(script, tag);
+        if (completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(dict);
+            });
+        }
+    });
 }
 
 static NSInteger YCYJSONInt(NSDictionary *dict, NSString *key) {
@@ -2348,15 +2485,20 @@ static void YCYRevealTickSchedule(void);
 static void YCYRevealTick(void) {
     if (!gRevealOn) { gRevealTicking = NO; return; }
     gRevealTick++;
-    NSDictionary *dict = nil;
-    // 第 1 拍和每 5 拍做一次完整同步（打 hide_time 补丁 + 拉服务端），其余只读缓存
-    if (gRevealTick % 5 == 1) {
-        dict = YCYEvalJSJSON(kYCYJSRevealSync, @"JS time-sync");
-    } else {
-        dict = YCYEvalJSJSON(kYCYJSRevealRead, @"JS time-read");
-    }
-    if (dict) YCYRevealApply(dict);
+    // 先用本地 deadline 刷新每秒倒计时，绝不在主线程同步等待 JSContext 锁
     YCYRevealUpdateLabel();
+    if (!gRevealSyncInFlight) {
+        gRevealSyncInFlight = YES;
+        BOOL fullSync = (gRevealTick % 5 == 1);
+        NSString *script = fullSync ? kYCYJSRevealSync : kYCYJSRevealRead;
+        NSString *tag = fullSync ? @"JS time-sync" : @"JS time-read";
+        YCYEvalJSJSONAsync(script, tag, ^(NSDictionary *dict) {
+            gRevealSyncInFlight = NO;
+            if (!gRevealOn) return;
+            if (dict) YCYRevealApply(dict);
+            YCYRevealUpdateLabel();
+        });
+    }
     YCYRevealTickSchedule();
 }
 
@@ -2375,35 +2517,42 @@ static void YCYRevealSetOn(BOOL on) {
         return;
     }
     gRevealTick = 0;
-    NSDictionary *dict = YCYEvalJSJSON(kYCYJSRevealSync, @"JS time-sync");
-    if (dict) YCYRevealApply(dict);
     YCYRevealUpdateLabel();
     if (!gRevealTicking) {
         gRevealTicking = YES;
         YCYRevealTickSchedule();
     }
-    if (gRevealDeadline > 0) {
-        YCYShowToast([NSString stringWithFormat:@"已显示隐藏时间：%@", YCYFormatClock((NSInteger)llround(gRevealDeadline - CFAbsoluteTimeGetCurrent()))]);
-    } else {
-        YCYShowToast(@"没读到 counts\n请先进游戏页再开");
+    if (!gRevealSyncInFlight) {
+        gRevealSyncInFlight = YES;
+        YCYEvalJSJSONAsync(kYCYJSRevealSync, @"JS time-sync", ^(NSDictionary *dict) {
+            gRevealSyncInFlight = NO;
+            if (!gRevealOn) return;
+            if (dict) YCYRevealApply(dict);
+            YCYRevealUpdateLabel();
+            if (gRevealDeadline > 0) {
+                YCYShowToast([NSString stringWithFormat:@"已显示隐藏时间：%@", YCYFormatClock((NSInteger)llround(gRevealDeadline - CFAbsoluteTimeGetCurrent()))]);
+            } else {
+                YCYShowToast(@"没读到 counts\n请先进游戏页再开");
+            }
+        });
     }
 }
 
 static void YCYRevealSyncOnce(void) {
-    NSDictionary *dict = YCYEvalJSJSON(kYCYJSRevealSync, @"JS time-sync");
-    if (!dict) {
-        YCYShowToast(@"没有 JSContext：请先打开 App 的游戏页");
-        return;
-    }
-    YCYRevealApply(dict);
-    YCYRevealUpdateLabel();
-    NSInteger left = 0;
-    if (gRevealDeadline > 0) left = (NSInteger)llround(gRevealDeadline - CFAbsoluteTimeGetCurrent());
-    YCYLog(@"time-sync id=%ld counts=%ld ls=%ld all=%ld used=%ld rate=%ld src=%@ n=%@ blocked=%ld",
-           (long)gRevealPlayId, (long)left, (long)gRevealLs, (long)gRevealAll,
-           (long)gRevealUsed, (long)gRevealRate, gRevealSrc, dict[@"n"],
-           (long)gRevealBlocked);
-    dispatch_async(dispatch_get_main_queue(), ^{
+    YCYShowToast(@"正在同步隐藏时间…");
+    YCYEvalJSJSONAsync(kYCYJSRevealSync, @"JS time-sync", ^(NSDictionary *dict) {
+        if (!dict) {
+            YCYShowToast(@"没有 JSContext：请先打开 App 的游戏页");
+            return;
+        }
+        YCYRevealApply(dict);
+        YCYRevealUpdateLabel();
+        NSInteger left = 0;
+        if (gRevealDeadline > 0) left = (NSInteger)llround(gRevealDeadline - CFAbsoluteTimeGetCurrent());
+        YCYLog(@"time-sync id=%ld counts=%ld ls=%ld all=%ld used=%ld rate=%ld src=%@ n=%@ blocked=%ld",
+               (long)gRevealPlayId, (long)left, (long)gRevealLs, (long)gRevealAll,
+               (long)gRevealUsed, (long)gRevealRate, gRevealSrc, dict[@"n"],
+               (long)gRevealBlocked);
         UIAlertController *a =
             [UIAlertController alertControllerWithTitle:@"隐藏时间（诊断）"
                                                 message:[NSString stringWithFormat:
@@ -2419,7 +2568,7 @@ static void YCYRevealSyncOnce(void) {
                     (long)gRevealBlocked]
                                          preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
-        [YCYTopVC() presentViewController:a animated:YES completion:nil];
+        YCYSafePresentVC(a, 0);
     });
 }
 
@@ -3031,6 +3180,44 @@ static void YCYTryUnlock(void) {
 
 #pragma mark - 日志 / 记录 UI
 
+@interface YCYLogViewController : UIViewController
+@property (nonatomic, copy) NSString *logText;
+@end
+
+@implementation YCYLogViewController
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor systemBackgroundColor];
+    self.title = @"YCY BLE 日志";
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"关闭"
+                                         style:UIBarButtonItemStyleDone
+                                        target:self
+                                        action:@selector(onClose)];
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"复制"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(onCopy)];
+    UITextView *tv = [[UITextView alloc] initWithFrame:self.view.bounds];
+    tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    tv.editable = NO;
+    tv.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    tv.text = self.logText ?: @"暂无 BLE 日志";
+    [self.view addSubview:tv];
+    if (tv.text.length > 0) {
+        [tv scrollRangeToVisible:NSMakeRange(tv.text.length - 1, 1)];
+    }
+}
+- (void)onClose {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+- (void)onCopy {
+    UIPasteboard.generalPasteboard.string = self.logText ?: @"";
+    YCYShowToast(@"当前视图日志已复制");
+}
+@end
+
 static void YCYShowLogs(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [bleLogLock lock];
@@ -3039,14 +3226,11 @@ static void YCYShowLogs(void) {
             : @"暂无 BLE 日志";
         [bleLogLock unlock];
 
-        UIAlertController *alert =
-            [UIAlertController alertControllerWithTitle:@"YCY BLE 日志"
-                                                message:text
-                                         preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"关闭"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:nil]];
-        [YCYTopVC() presentViewController:alert animated:YES completion:nil];
+        YCYLogViewController *vc = [YCYLogViewController new];
+        vc.logText = text;
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+        nav.modalPresentationStyle = UIModalPresentationPageSheet;
+        YCYSafePresentVC(nav, 0);
     });
 }
 
@@ -3066,6 +3250,10 @@ static void YCYShowRecords(void) {
              (unsigned long)gSessionGen];
             NSInteger i = 1;
             for (YCYRecordedWrite *item in unique.count ? unique : all) {
+                if (i > 12) {
+                    [text appendString:@"…（更多记录已省略）\n"];
+                    break;
+                }
                 [text appendFormat:@"%ld. %@ %@\n%@\n\n",
                  (long)i++,
                  item.heartbeatLike ? @"[心跳]" : @"[唯一]",
@@ -3096,30 +3284,42 @@ static void YCYShowRecords(void) {
         [alert addAction:[UIAlertAction actionWithTitle:@"关闭"
                                                   style:UIAlertActionStyleCancel
                                                 handler:nil]];
-        [YCYTopVC() presentViewController:alert animated:YES completion:nil];
+        YCYSafePresentVC(alert, 0);
     });
 }
 
 static void YCYCopyLogs(void) {
-    [bleLogLock lock];
-    NSString *fileText = [NSString stringWithContentsOfFile:YCYLogFilePath() encoding:NSUTF8StringEncoding error:nil];
-    NSString *out = fileText.length ? fileText : [bleLogs componentsJoinedByString:@"\n"];
-    [bleLogLock unlock];
-    UIPasteboard.generalPasteboard.string = out ?: @"";
-    YCYShowToast(@"日志已复制（含文件）");
+    dispatch_queue_t q = gLogFileQueue ?: dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+    dispatch_async(q, ^{
+        NSString *fileText = [NSString stringWithContentsOfFile:YCYLogFilePath() encoding:NSUTF8StringEncoding error:nil];
+        NSString *out = fileText;
+        if (!out.length) {
+            [bleLogLock lock];
+            out = [bleLogs componentsJoinedByString:@"\n"];
+            [bleLogLock unlock];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIPasteboard.generalPasteboard.string = out ?: @"";
+            YCYShowToast(@"日志已复制（含文件）");
+        });
+    });
 }
 
 static void YCYClearLogs(void) {
     [bleLogLock lock];
     [bleLogs removeAllObjects];
-    @autoreleasepool {
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:YCYLogFilePath()];
-        if (fh) {
-            [fh truncateFileAtOffset:0];
-            [fh closeFile];
-        }
-    }
     [bleLogLock unlock];
+    if (gLogFileQueue) {
+        dispatch_async(gLogFileQueue, ^{
+            @autoreleasepool {
+                NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:YCYLogFilePath()];
+                if (fh) {
+                    [fh truncateFileAtOffset:0];
+                    [fh closeFile];
+                }
+            }
+        });
+    }
     YCYLog(@"Logs cleared");
     YCYShowToast(@"日志已清空");
 }
@@ -3155,9 +3355,18 @@ static void YCYClearRecords(void) {
 
 @implementation YCYOverlayWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hitView = [super hitTest:point withEvent:event];
-    if (hitView == self || hitView == self.rootViewController.view) return nil;
-    return hitView;
+    // 仅允许悬浮窗内的可交互子控件（如 floatButton）接收触摸，其余区域全部透传给底层 App，绝不阻塞界面
+    UIView *rootView = self.rootViewController.view;
+    if (!rootView || self.hidden || self.alpha <= 0.01) return nil;
+    for (UIView *sub in [rootView.subviews reverseObjectEnumerator]) {
+        if (sub.hidden || !sub.userInteractionEnabled || sub.alpha <= 0.01) continue;
+        CGPoint p = [sub convertPoint:point fromView:self];
+        if ([sub pointInside:p withEvent:event]) {
+            UIView *target = [sub hitTest:p withEvent:event];
+            if (target) return target;
+        }
+    }
+    return nil;
 }
 @end
 
@@ -3274,10 +3483,16 @@ static void YCYShowMenu(UIButton *sender) {
                                             handler:nil]];
 
     if (menu.popoverPresentationController) {
-        menu.popoverPresentationController.sourceView = sender ?: floatButton;
-        menu.popoverPresentationController.sourceRect = sender.bounds;
+        UIView *hostView = YCYTopVC().view;
+        if (hostView && sender && sender.window) {
+            menu.popoverPresentationController.sourceView = hostView;
+            menu.popoverPresentationController.sourceRect = [sender convertRect:sender.bounds toView:hostView];
+        } else {
+            menu.popoverPresentationController.sourceView = hostView;
+            menu.popoverPresentationController.sourceRect = CGRectMake(hostView.bounds.size.width / 2.0, hostView.bounds.size.height / 2.0, 1, 1);
+        }
     }
-    [YCYTopVC() presentViewController:menu animated:YES completion:nil];
+    YCYSafePresentVC(menu, 0);
 }
 
 @implementation YCYUnlockHelper
@@ -3345,6 +3560,17 @@ static void YCYShowMenu(UIButton *sender) {
 static void YCYCreateFloatingButton(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (floatWindow) {
+            if (@available(iOS 13.0, *)) {
+                if (!floatWindow.windowScene) {
+                    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                        if ([scene isKindOfClass:[UIWindowScene class]] &&
+                            scene.activationState == UISceneActivationStateForegroundActive) {
+                            floatWindow.windowScene = (UIWindowScene *)scene;
+                            break;
+                        }
+                    }
+                }
+            }
             floatWindow.hidden = NO;
             if (floatButton) floatButton.hidden = NO;
             return;
@@ -3620,7 +3846,7 @@ static void YCYScheduleFloatingButton(void) {
 
 - (JSValue *)evaluateScript:(NSString *)script {
     YCYRememberJSContext(self);
-    if (!gInJSProbe && script.length > 4000) {
+    if (!YCYIsInJSProbe() && script.length > 4000) {
         YCYLog(@"JS eval len=%lu", (unsigned long)script.length);
         YCYLogScriptNeedle(script, @"_ble_do");
         YCYLogScriptNeedle(script, @"_init_ble");
@@ -3631,7 +3857,7 @@ static void YCYScheduleFloatingButton(void) {
 
 - (JSValue *)evaluateScript:(NSString *)script withSourceURL:(NSURL *)sourceURL {
     YCYRememberJSContext(self);
-    if (!gInJSProbe && script.length > 4000) {
+    if (!YCYIsInJSProbe() && script.length > 4000) {
         YCYLog(@"JS eval(url) len=%lu url=%@", (unsigned long)script.length, sourceURL);
         YCYLogScriptNeedle(script, @"_ble_do");
         YCYLogScriptNeedle(script, @"_init_ble");
@@ -3650,9 +3876,11 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     YCYInitState();
     YCYLog(@"didFinishLaunching");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         YCYDumpInterestingClasses();
-        YCYDumpDCBLENow(@"launch");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            YCYDumpDCBLENow(@"launch");
+        });
     });
     BOOL result = %orig(application, launchOptions);
     YCYScheduleFloatingButton();
